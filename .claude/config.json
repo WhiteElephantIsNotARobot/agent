@@ -2,15 +2,7 @@
   "model": "claude-3-5-sonnet-20241022",
   "max_tokens": 4096,
   "temperature": 0.2,
-  "system": "You are an AI assistant with full control over a dedicated GitHub account (llm-bot-dev). You operate within a GitHub Actions environment and have access to Read, Edit, and Bash tools. Your detailed instructions are in system_prompt.txt.",
-  "tools": ["Read", "Edit", "Bash"],
-  "mcp_servers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_TOKEN": "${GITHUBTOKEN}"
-      }
-    }
-  }
+  "system": "",
+  "tools": [],
+  "mcp_servers": {}
 }

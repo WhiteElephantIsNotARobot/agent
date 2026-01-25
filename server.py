@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-FastAPI server that receives GitHub webhooks and triggers the LLM bot workflow.
+接收GitHub webhook并触发LLM机器人工作流的FastAPI服务器。
 
-Environment variables needed:
-- GITHUB_TOKEN: Personal Access Token with repo permissions
-- WEBHOOK_SECRET: GitHub webhook secret for verification
-- CONTROL_REPO: Repository where workflow is located (e.g., "owner/llm-bot-control")
+所需环境变量：
+- GITHUB_TOKEN：具有仓库权限的个人访问令牌
+- WEBHOOK_SECRET：用于验证的GitHub webhook密钥
+- CONTROL_REPO：工作流所在的仓库（例如 "owner/llm-bot-control"）
 """
 
 import os
@@ -19,33 +19,33 @@ from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel, Field
 import httpx
 
-# Configure logging
+# 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="LLM Bot Webhook Server")
 
-# GitHub API configuration
+# GitHub API 配置
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 CONTROL_REPO = os.getenv("CONTROL_REPO", "owner/llm-bot-control")
 
-# Headers for GitHub API requests
+# GitHub API 请求头
 headers = {
     "Authorization": f"token {GITHUB_TOKEN}",
     "Accept": "application/vnd.github.v3+json",
     "User-Agent": "LLM-Bot-Server"
 }
 
-# Environment validation
+# 环境变量验证
 if not GITHUB_TOKEN:
     logger.warning("GITHUB_TOKEN environment variable is not set. Workflow triggering will fail.")
 if not WEBHOOK_SECRET:
     logger.warning("WEBHOOK_SECRET environment variable is not set. Webhook signature verification is disabled.")
 
 class TaskContext(BaseModel):
-    """Context data extracted from webhook event."""
+    """从webhook事件中提取的上下文数据。"""
     repo: str = Field(..., description="Repository full name (owner/repo)")
     event_type: str = Field(..., description="GitHub event type")
     event_id: str = Field(..., description="GitHub event ID")
@@ -59,7 +59,7 @@ class TaskContext(BaseModel):
     discussion_body: Optional[str] = Field(None, description="Discussion body if applicable")
 
 def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool:
-    """Verify GitHub webhook signature."""
+    """验证GitHub webhook签名。"""
     if not WEBHOOK_SECRET:
         logger.warning("WEBHOOK_SECRET not set, skipping signature verification")
         return True
@@ -77,7 +77,7 @@ def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool
         return False
 
 def extract_context_from_event(event_type: str, payload: Dict[str, Any], event_id: str = "") -> TaskContext:
-    """Extract relevant context from GitHub webhook payload."""
+    """从GitHub webhook负载中提取相关上下文。"""
     repo = payload.get("repository", {}).get("full_name", "")
     
     context = TaskContext(
@@ -123,7 +123,7 @@ def extract_context_from_event(event_type: str, payload: Dict[str, Any], event_i
     return context
 
 def generate_task_description(event_type: str, context: TaskContext) -> str:
-    """Generate natural language task description based on event type."""
+    """根据事件类型生成自然语言任务描述。"""
     if event_type == "pull_request":
         return f"Review PR #{context.issue_number} in {context.repo} and provide feedback or code improvements."
     elif event_type == "issue_comment" and context.comment_body and "@llm-bot-dev" in context.comment_body:
@@ -136,7 +136,7 @@ def generate_task_description(event_type: str, context: TaskContext) -> str:
         return f"Handle {event_type} event in {context.repo}."
 
 async def trigger_workflow_dispatch(task: str, context: TaskContext):
-    """Trigger the workflow_dispatch event in the control repository."""
+    """在控制仓库中触发 workflow_dispatch 事件。"""
     url = f"{GITHUB_API}/repos/{CONTROL_REPO}/actions/workflows/llm-bot-runner.yml/dispatches"
     
     payload = {
@@ -168,15 +168,15 @@ async def github_webhook(
     x_github_event: Optional[str] = Header(None),
     x_github_delivery: Optional[str] = Header(None)
 ):
-    """Endpoint for GitHub webhooks."""
-    # Read raw body for signature verification
+    """GitHub webhooks 端点。"""
+    # 读取原始请求体用于签名验证
     body_bytes = await request.body()
     
-    # Verify signature if secret is configured
+    # 如果配置了密钥则验证签名
     if x_hub_signature_256 and not verify_webhook_signature(body_bytes, x_hub_signature_256):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
     
-    # Parse JSON payload
+    # 解析JSON负载
     try:
         payload = await request.json()
     except json.JSONDecodeError:
@@ -185,14 +185,14 @@ async def github_webhook(
     event_type = x_github_event or "unknown"
     logger.info(f"Received {event_type} event for {payload.get('repository', {}).get('full_name', 'unknown')}")
     
-    # Extract context from payload
+    # 从负载中提取上下文
     event_id = x_github_delivery or ""
     context = extract_context_from_event(event_type, payload, event_id)
     
-    # Generate task description
+    # 生成任务描述
     task = generate_task_description(event_type, context)
     
-    # Trigger workflow in background
+    # 在后台触发工作流
     background_tasks.add_task(trigger_workflow_dispatch, task, context)
     
     return {
@@ -204,7 +204,7 @@ async def github_webhook(
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """健康检查端点。"""
     return {"status": "healthy", "service": "llm-bot-webhook-server"}
 
 if __name__ == "__main__":
