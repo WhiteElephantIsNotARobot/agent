@@ -1,0 +1,108 @@
+name: LLM Bot Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'LLM的任务描述'
+        required: true
+        type: string
+      context:
+        description: '任务的JSON上下文'
+        required: true
+        type: string
+
+jobs:
+  run-llm-bot:
+    runs-on: ubuntu-latest
+    env:
+      LLM_TASK: ${{ inputs.task }}
+      LLM_CONTEXT: ${{ inputs.context }}
+      GITHUBTOKEN: ${{ secrets.LLMGH_TOKEN }}
+      GHTOKEN: ${{ secrets.LLMGH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      discussions: write
+    steps:
+      - name: 检出控制仓库（包含Claude/MCP配置）
+        uses: actions/checkout@v4
+
+      - name: 准备Claude Code配置
+        run: |
+          mkdir -p ~/.claude
+          if [ -d .claude ]; then
+            cp -r .claude/* ~/.claude/
+          fi
+          if [ -f claude.config.json ]; then
+            cp claude.config.json ~/.claude/config.json
+          fi
+          if [ -f mcp.config.json ]; then
+            cp mcp.config.json ~/.claude/mcp.config.json
+          fi
+      
+      - name: 加载系统提示词
+        run: |
+          mkdir -p ~/.claude
+          if [ -f system_prompt.txt ]; then
+            cp system_prompt.txt ~/.claude/system_prompt.txt
+            echo "SYSTEM_PROMPT_FILE=~/.claude/system_prompt.txt" >> $GITHUB_ENV
+          else
+            echo "Using default system prompt"
+            echo 'SYSTEM_PROMPT=You are an AI assistant with full control over a dedicated GitHub account (llm-bot-dev).' >> $GITHUB_ENV
+          fi
+
+      - name: 验证配置和令牌
+        run: |
+          echo "Validating configuration files..."
+          if [ ! -f ~/.claude/config.json ]; then
+            echo "Error: config.json not found"
+            exit 1
+          fi
+          if [ ! -f ~/.claude/mcp.config.json ]; then
+            echo "Warning: mcp.config.json not found"
+          fi
+          if [ -z "$GITHUBTOKEN" ]; then
+            echo "Error: GITHUBTOKEN not set"
+            exit 1
+          else
+            echo "Checking GitHub token access..."
+            gh auth status || exit 1
+          fi
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "Error: ANTHROPIC_API_KEY not set"
+            exit 1
+          else
+            echo "Anthropic API key is set"
+          fi
+
+      - name: 安装Claude CLI
+        run: |
+          curl -sSL https://install.anthropic.com | sh
+
+      - name: 以GitHub机器人身份运行Claude Code
+        run: |
+          if [ -f ~/.claude/system_prompt.txt ]; then
+            claude \
+              -p "$LLM_TASK" \
+              --append-user-prompt "$LLM_CONTEXT" \
+              --system-prompt-file ~/.claude/system_prompt.txt \
+              --allowedTools "Read,Edit,Bash"
+          elif [ -n "$SYSTEM_PROMPT" ]; then
+            claude \
+              -p "$LLM_TASK" \
+              --append-user-prompt "$LLM_CONTEXT" \
+              --system-prompt "$SYSTEM_PROMPT" \
+              --allowedTools "Read,Edit,Bash"
+          else
+            claude \
+              -p "$LLM_TASK" \
+              --append-user-prompt "$LLM_CONTEXT" \
+              --allowedTools "Read,Edit,Bash"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.LLMGH_TOKEN }}
+          GH_TOKEN: ${{ secrets.LLMGH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
