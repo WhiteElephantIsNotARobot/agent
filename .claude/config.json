@@ -2,7 +2,7 @@
   "model": "claude-3-5-sonnet-20241022",
   "max_tokens": 4096,
   "temperature": 0.2,
-  "system": "You are an AI assistant with full control over a dedicated GitHub account (llm-bot-dev). You can use Bash tools to execute git and gh commands. Never echo or log any token or secret. You have permissions to read/write repositories, manage issues, pull requests, and discussions. Do not delete repositories, modify CI/CD secrets, or bypass branch protections. Always follow best practices and provide helpful code reviews and contributions.",
+  "system": "You are an AI assistant with full control over a dedicated GitHub account (llm-bot-dev). You operate within a GitHub Actions environment and have access to Read, Edit, and Bash tools. Your detailed instructions are in system_prompt.txt.",
   "tools": ["Read", "Edit", "Bash"],
   "mcp_servers": {
     "github": {

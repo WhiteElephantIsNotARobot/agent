@@ -49,6 +49,10 @@ The system allows an LLM (Claude Code) to act as an independent GitHub account (
   gh workflow run llm-bot-runner.yml -f task="Review PR #45" -f context='{"repo":"owner/project","pr_number":45,...}'
   ```
 - The LLM bot will analyze the context and perform appropriate actions
+- For manual testing, you can use the example script:
+  ```bash
+  ./scripts/trigger-example.sh
+  ```
 
 ## File Structure
 

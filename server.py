@@ -38,6 +38,12 @@ headers = {
     "User-Agent": "LLM-Bot-Server"
 }
 
+# Environment validation
+if not GITHUB_TOKEN:
+    logger.warning("GITHUB_TOKEN environment variable is not set. Workflow triggering will fail.")
+if not WEBHOOK_SECRET:
+    logger.warning("WEBHOOK_SECRET environment variable is not set. Webhook signature verification is disabled.")
+
 class TaskContext(BaseModel):
     """Context data extracted from webhook event."""
     repo: str = Field(..., description="Repository full name (owner/repo)")
@@ -70,10 +76,9 @@ def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool
         logger.error(f"Error verifying signature: {e}")
         return False
 
-def extract_context_from_event(event_type: str, payload: Dict[str, Any]) -> TaskContext:
+def extract_context_from_event(event_type: str, payload: Dict[str, Any], event_id: str = "") -> TaskContext:
     """Extract relevant context from GitHub webhook payload."""
     repo = payload.get("repository", {}).get("full_name", "")
-    event_id = payload.get("headers", {}).get("X-GitHub-Delivery", "") if isinstance(payload.get("headers"), dict) else ""
     
     context = TaskContext(
         repo=repo,
@@ -82,35 +87,38 @@ def extract_context_from_event(event_type: str, payload: Dict[str, Any]) -> Task
     )
     
     # Extract based on event type
-    if event_type == "issues":
-        issue = payload.get("issue", {})
-        context.issue_number = issue.get("number")
-        context.trigger_user = issue.get("user", {}).get("login")
-        context.comment_body = issue.get("body")
-    elif event_type == "issue_comment":
-        issue = payload.get("issue", {})
-        comment = payload.get("comment", {})
-        context.issue_number = issue.get("number")
-        context.trigger_user = comment.get("user", {}).get("login")
-        context.comment_body = comment.get("body")
-    elif event_type == "pull_request":
-        pr = payload.get("pull_request", {})
-        context.issue_number = pr.get("number")
-        context.trigger_user = pr.get("user", {}).get("login")
-        context.pr_title = pr.get("title")
-        context.pr_body = pr.get("body")
-        context.pr_diff_url = pr.get("diff_url")
-    elif event_type == "pull_request_review_comment":
-        pr = payload.get("pull_request", {})
-        comment = payload.get("comment", {})
-        context.issue_number = pr.get("number")
-        context.trigger_user = comment.get("user", {}).get("login")
-        context.comment_body = comment.get("body")
-    elif event_type == "discussion":
-        discussion = payload.get("discussion", {})
-        context.trigger_user = discussion.get("user", {}).get("login")
-        context.discussion_title = discussion.get("title")
-        context.discussion_body = discussion.get("body")
+    try:
+        if event_type == "issues":
+            issue = payload.get("issue", {})
+            context.issue_number = issue.get("number")
+            context.trigger_user = issue.get("user", {}).get("login")
+            context.comment_body = issue.get("body")
+        elif event_type == "issue_comment":
+            issue = payload.get("issue", {})
+            comment = payload.get("comment", {})
+            context.issue_number = issue.get("number")
+            context.trigger_user = comment.get("user", {}).get("login")
+            context.comment_body = comment.get("body")
+        elif event_type == "pull_request":
+            pr = payload.get("pull_request", {})
+            context.issue_number = pr.get("number")
+            context.trigger_user = pr.get("user", {}).get("login")
+            context.pr_title = pr.get("title")
+            context.pr_body = pr.get("body")
+            context.pr_diff_url = pr.get("diff_url")
+        elif event_type == "pull_request_review_comment":
+            pr = payload.get("pull_request", {})
+            comment = payload.get("comment", {})
+            context.issue_number = pr.get("number")
+            context.trigger_user = comment.get("user", {}).get("login")
+            context.comment_body = comment.get("body")
+        elif event_type == "discussion":
+            discussion = payload.get("discussion", {})
+            context.trigger_user = discussion.get("user", {}).get("login")
+            context.discussion_title = discussion.get("title")
+            context.discussion_body = discussion.get("body")
+    except Exception as e:
+        logger.error(f"Error extracting context from {event_type} event: {e}")
     
     return context
 
@@ -157,7 +165,8 @@ async def github_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
     x_hub_signature_256: Optional[str] = Header(None),
-    x_github_event: Optional[str] = Header(None)
+    x_github_event: Optional[str] = Header(None),
+    x_github_delivery: Optional[str] = Header(None)
 ):
     """Endpoint for GitHub webhooks."""
     # Read raw body for signature verification
@@ -177,7 +186,8 @@ async def github_webhook(
     logger.info(f"Received {event_type} event for {payload.get('repository', {}).get('full_name', 'unknown')}")
     
     # Extract context from payload
-    context = extract_context_from_event(event_type, payload)
+    event_id = x_github_delivery or ""
+    context = extract_context_from_event(event_type, payload, event_id)
     
     # Generate task description
     task = generate_task_description(event_type, context)

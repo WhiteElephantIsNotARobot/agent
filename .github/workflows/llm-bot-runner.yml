@@ -54,6 +54,30 @@ jobs:
             echo 'SYSTEM_PROMPT=You are an AI assistant with full control over a dedicated GitHub account (llm-bot-dev).' >> $GITHUB_ENV
           fi
 
+      - name: Validate configuration and tokens
+        run: |
+          echo "Validating configuration files..."
+          if [ ! -f ~/.claude/config.json ]; then
+            echo "Error: config.json not found"
+            exit 1
+          fi
+          if [ ! -f ~/.claude/mcp.config.json ]; then
+            echo "Warning: mcp.config.json not found"
+          fi
+          if [ -z "$GITHUBTOKEN" ]; then
+            echo "Error: GITHUBTOKEN not set"
+            exit 1
+          else
+            echo "Checking GitHub token access..."
+            gh auth status || exit 1
+          fi
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "Error: ANTHROPIC_API_KEY not set"
+            exit 1
+          else
+            echo "Anthropic API key is set"
+          fi
+
       - name: Install Claude CLI
         run: |
           curl -sSL https://install.anthropic.com | sh
