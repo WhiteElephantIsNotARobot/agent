@@ -1,0 +1,7 @@
+{
+  "enableAllProjectMcpServers": true,
+  "language": "chinese",
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  }
+}
