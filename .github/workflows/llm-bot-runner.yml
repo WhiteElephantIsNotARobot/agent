@@ -1,0 +1,84 @@
+name: LLM Bot Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'Task description for the LLM'
+        required: true
+        type: string
+      context:
+        description: 'JSON context for the task'
+        required: true
+        type: string
+
+jobs:
+  run-llm-bot:
+    runs-on: ubuntu-latest
+    env:
+      LLM_TASK: ${{ inputs.task }}
+      LLM_CONTEXT: ${{ inputs.context }}
+      GITHUBTOKEN: ${{ secrets.LLMGH_TOKEN }}
+      GHTOKEN: ${{ secrets.LLMGH_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      discussions: write
+    steps:
+      - name: Checkout control repo (with Claude/MCP config)
+        uses: actions/checkout@v4
+
+      - name: Prepare Claude Code config
+        run: |
+          mkdir -p ~/.claude
+          if [ -d .claude ]; then
+            cp -r .claude/* ~/.claude/
+          fi
+          if [ -f claude.config.json ]; then
+            cp claude.config.json ~/.claude/config.json
+          fi
+          if [ -f mcp.config.json ]; then
+            cp mcp.config.json ~/.claude/mcp.config.json
+          fi
+      
+      - name: Load system prompt
+        run: |
+          mkdir -p ~/.claude
+          if [ -f system_prompt.txt ]; then
+            cp system_prompt.txt ~/.claude/system_prompt.txt
+            echo "SYSTEM_PROMPT_FILE=~/.claude/system_prompt.txt" >> $GITHUB_ENV
+          else
+            echo "Using default system prompt"
+            echo 'SYSTEM_PROMPT=You are an AI assistant with full control over a dedicated GitHub account (llm-bot-dev).' >> $GITHUB_ENV
+          fi
+
+      - name: Install Claude CLI
+        run: |
+          curl -sSL https://install.anthropic.com | sh
+
+      - name: Run Claude Code as GitHub Bot
+        run: |
+          if [ -f ~/.claude/system_prompt.txt ]; then
+            claude \
+              -p "$LLM_TASK" \
+              --append-user-prompt "$LLM_CONTEXT" \
+              --system-prompt-file ~/.claude/system_prompt.txt \
+              --allowedTools "Read,Edit,Bash"
+          elif [ -n "$SYSTEM_PROMPT" ]; then
+            claude \
+              -p "$LLM_TASK" \
+              --append-user-prompt "$LLM_CONTEXT" \
+              --system-prompt "$SYSTEM_PROMPT" \
+              --allowedTools "Read,Edit,Bash"
+          else
+            claude \
+              -p "$LLM_TASK" \
+              --append-user-prompt "$LLM_CONTEXT" \
+              --allowedTools "Read,Edit,Bash"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.LLMGH_TOKEN }}
+          GH_TOKEN: ${{ secrets.LLMGH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
