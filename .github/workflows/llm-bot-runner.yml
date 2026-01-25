@@ -18,8 +18,8 @@ jobs:
     env:
       LLM_TASK: ${{ inputs.task }}
       LLM_CONTEXT: ${{ inputs.context }}
-      GITHUBTOKEN: ${{ secrets.LLMGH_TOKEN }}
-      GHTOKEN: ${{ secrets.LLMGH_TOKEN }}
+      GITHUBTOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHTOKEN: ${{ secrets.GITHUB_TOKEN }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     permissions:
       contents: write
@@ -103,8 +103,8 @@ jobs:
               --allowedTools "Read,Edit,Bash"
           fi
         env:
-          GITHUB_TOKEN: ${{ secrets.LLMGH_TOKEN }}
-          GH_TOKEN: ${{ secrets.LLMGH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
           WEINAR_API_KEY: ${{ secrets.WEINAR_API_KEY }}
