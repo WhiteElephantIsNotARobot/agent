@@ -26,7 +26,6 @@ user_graphql_headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "ap
 
 app = FastAPI()
 processed_cache: Set[str] = set()
-# 回归稳定版本：使用 last_modified
 state = {"last_modified": None, "poll_interval": 60}
 
 # --- 缓存持久化 ---
@@ -52,7 +51,7 @@ class TaskContext(BaseModel):
     base_ref: Optional[str] = None
     latest_comment_url: Optional[str] = None
 
-# --- 上下文抓取逻辑 ---
+# --- 上下文抓取逻辑 (全场景) ---
 async def fetch_discussion_by_node(client: httpx.AsyncClient, node_id: str):
     query = "query($id:ID!){node(id:$id){...on Discussion{body number author{login}url}}}"
     resp = await client.post(GITHUB_GRAPHQL, json={"query": query, "variables": {"id": node_id}}, headers=user_graphql_headers)
@@ -64,8 +63,8 @@ async def handle_note(client: httpx.AsyncClient, note: Dict):
     note_id = note["id"]
     context = TaskContext(repo=repo_full, event_type=subject["type"].lower(), event_id=note_id, latest_comment_url=subject.get("latest_comment_url"))
     
-    # 动态任务文本，默认使用正文
-    task_text = ""
+    # 【新增】用于存放最终提取出的任务指令
+    target_task = ""
 
     try:
         # A. Discussion 场景
@@ -77,14 +76,14 @@ async def handle_note(client: httpx.AsyncClient, note: Dict):
                 if data:
                     context.issue_body, context.issue_number = data["body"][:3000], data["number"]
                     context.trigger_user = data["author"]["login"]
-                    task_text = data["body"] # 默认任务
-                    
+                    target_task = data["body"] # 默认任务是正文
                     if context.latest_comment_url:
                         lc = await client.get(context.latest_comment_url, headers=user_rest_headers)
                         if lc.status_code == 200:
-                            lc_data = lc.json()
-                            context.trigger_user = lc_data.get("author", {}).get("login") or context.trigger_user
-                            task_text = lc_data.get("body") # 更新为特定评论
+                            lc_json = lc.json()
+                            context.trigger_user = lc_json.get("author", {}).get("login") or context.trigger_user
+                            target_task = lc_json.get("body") # 更新为特定评论内容
+                    context.clone_url = note["repository"]["html_url"] + ".git"
 
         # B. Issue / PR 场景
         elif subject["type"] in ["Issue", "PullRequest"]:
@@ -93,14 +92,13 @@ async def handle_note(client: httpx.AsyncClient, note: Dict):
                 detail = detail_resp.json()
                 context.issue_number, context.trigger_user = detail.get("number"), detail.get("user", {}).get("login")
                 context.issue_body = (detail.get("body") or "")[:3000]
-                task_text = context.issue_body # 默认任务
-                
+                target_task = context.issue_body # 默认任务是正文
                 if context.latest_comment_url:
                     lc = await client.get(context.latest_comment_url, headers=user_rest_headers)
                     if lc.status_code == 200:
-                        lc_data = lc.json()
-                        context.trigger_user = lc_data.get("user", {}).get("login") or context.trigger_user
-                        task_text = lc_data.get("body") # 更新为特定评论
+                        lc_json = lc.json()
+                        context.trigger_user = lc_json.get("user", {}).get("login") or context.trigger_user
+                        target_task = lc_json.get("body") # 更新为特定评论内容
                 
                 if subject["type"] == "PullRequest":
                     context.clone_url, context.head_ref, context.base_ref = detail.get("head", {}).get("repo", {}).get("clone_url"), detail.get("head", {}).get("ref"), detail.get("base", {}).get("ref")
@@ -112,40 +110,36 @@ async def handle_note(client: httpx.AsyncClient, note: Dict):
             context.clone_url, context.commit_sha = note["repository"]["html_url"] + ".git", subject["url"].split("/")[-1]
             comm_resp = await client.get(f"{subject['url']}/comments", headers=user_rest_headers)
             if comm_resp.status_code == 200 and comm_resp.json():
-                last_comm = comm_resp.json()[-1]
-                context.trigger_user = last_comm["user"]["login"]
-                task_text = last_comm["body"]
+                last_comment = comm_resp.json()[-1]
+                context.trigger_user = last_comment["user"]["login"]
+                target_task = last_comment["body"]
 
-        # 校验权限
-        if ALLOWED_USERS and context.trigger_user not in ALLOWED_USERS:
-            logger.info(f"Ignored: User {context.trigger_user} not in allowed list.")
-            return
-
-        # 触发工作流
-        await trigger_workflow(context, task_text)
+        if ALLOWED_USERS and context.trigger_user not in ALLOWED_USERS: return
+        # 【修改】将提取出的 target_task 传给触发函数
+        await trigger_workflow(context, target_task)
 
     except Exception as e: logger.error(f"Handle Error: {e}")
 
-async def trigger_workflow(ctx: TaskContext, task_text: str):
+async def trigger_workflow(ctx: TaskContext, task_content: str):
     payload_str = ctx.model_dump_json()
     if len(payload_str) > 60000:
         ctx.issue_body = ctx.issue_body[:500] + "..."
         payload_str = ctx.model_dump_json()
 
+    # 兜底：如果没提取到内容，使用默认值
+    final_task = task_content if task_content else "New AI Task"
+
     url = f"{GITHUB_API}/repos/{CONTROL_REPO}/actions/workflows/llm-bot-runner.yml/dispatches"
     async with httpx.AsyncClient() as client:
-        # 使用 task_text 替换硬编码的 "AI_TASK"
+        # 【核心修正】inputs.task 现在使用动态提取的内容
         r = await client.post(url, headers=user_rest_headers, json={
             "ref": "main", 
-            "inputs": {
-                "task": (task_text or "New Task")[:2000], 
-                "context": payload_str
-            }
+            "inputs": {"task": final_task[:1000], "context": payload_str}
         })
         if r.status_code == 204:
             await client.patch(f"{GITHUB_API}/notifications/threads/{ctx.event_id}", headers=bot_headers)
             mark_processed_disk(ctx.event_id)
-            logger.info(f"Workflow dispatched: {ctx.event_id}, Task: {task_text[:30]}...")
+            logger.info(f"Workflow dispatched. Task: {final_task[:30]}... ID: {ctx.event_id}")
 
 async def poll_loop():
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -153,16 +147,13 @@ async def poll_loop():
             try:
                 curr_headers = bot_headers.copy()
                 if state["last_modified"]: curr_headers["If-Modified-Since"] = state["last_modified"]
-                
                 resp = await client.get(f"{GITHUB_API}/notifications", headers=curr_headers, params={"all": "false"})
                 state["poll_interval"] = int(resp.headers.get("X-Poll-Interval", 60))
-                
                 if resp.status_code == 200:
                     state["last_modified"] = resp.headers.get("Last-Modified")
                     for note in resp.json():
-                        # 保持原有的 reason 过滤
                         if note["reason"] in ["mention", "team_mention"] and note["id"] not in processed_cache:
-                            processed_cache.add(note["id"])
+                            processed_cache.add(note["id"]) 
                             asyncio.create_task(handle_note(client, note))
             except Exception as e: logger.error(f"Poll Error: {e}")
             await asyncio.sleep(state["poll_interval"])
