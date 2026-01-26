@@ -1,634 +1,162 @@
-#!/usr/bin/env python3
-"""
-接收GitHub webhook并触发LLM机器人工作流的FastAPI服务器。
-
-所需环境变量：
-- GITHUB_TOKEN：具有仓库权限的个人访问令牌
-- WEBHOOK_SECRET：用于验证的GitHub webhook密钥
-- CONTROL_REPO：工作流所在的仓库（例如 "owner/llm-bot-control"）
-- BOT_USER_ID：机器人账号ID（单个，不带@符号）
-- ALLOWED_USERS：逗号分隔的授权用户列表（可选，为空则允许所有用户）
-- CONTEXT_MAX_CHARS：上下文最大字符数，默认5000（可选）
-"""
-
-import os
-import hmac
-import hashlib
-import json
-import logging
-from typing import Dict, Any, Optional
-
-from fastapi import FastAPI, Request, HTTPException, Header, BackgroundTasks
-from pydantic import BaseModel, Field
+import os, json, logging, asyncio
+from typing import Dict, Any, Optional, List, Set
+from fastapi import FastAPI
+from pydantic import BaseModel
 import httpx
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="LLM Bot Webhook Server")
-
-# GitHub API 配置
+# --- 配置 ---
 GITHUB_API = "https://api.github.com"
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-CONTROL_REPO = os.getenv("CONTROL_REPO")  # 必须设置，无默认值
+GITHUB_GRAPHQL = "https://api.github.com/graphql"
 
-# 机器人账号ID（单个，不带@符号）
-BOT_USER_ID = os.getenv("BOT_USER_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN")          
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")    
+CONTROL_REPO = os.getenv("CONTROL_REPO")
+ALLOWED_USERS = [u.strip() for u in os.getenv("ALLOWED_USERS", "").split(",") if u.strip()]
+PROCESSED_LOG = "/data/processed_notifications.log"
 
-# 生成机器人提及格式（带@和不带@）
-if BOT_USER_ID:
-    BOT_MENTIONS = (f"@{BOT_USER_ID}", BOT_USER_ID)  # 同时检查带@和不带@的提及
-else:
-    BOT_MENTIONS = tuple()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("BotWatcher")
 
-# 授权用户列表（逗号分隔）
-ALLOWED_USERS = [user.strip() for user in os.getenv("ALLOWED_USERS", "").split(",") if user.strip()]
+bot_headers = {"Authorization": f"token {BOT_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+user_rest_headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+user_graphql_headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
 
-# 上下文最大字符数
-CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "5000"))
+app = FastAPI()
+state = {"last_modified": None, "poll_interval": 60}
+processed_cache: Set[str] = set()
 
-# GitHub API 请求头
-headers = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "LLM-Bot-Server"
-}
+# --- 缓存与持久化 ---
+def load_processed_log():
+    if os.path.exists(PROCESSED_LOG):
+        with open(PROCESSED_LOG, "r") as f:
+            for line in f: processed_cache.add(line.strip())
+    logger.info(f"Loaded {len(processed_cache)} entries.")
 
-# 环境变量验证
-if not GITHUB_TOKEN:
-    logger.warning("GITHUB_TOKEN environment variable is not set. Workflow triggering will fail.")
-if not WEBHOOK_SECRET:
-    logger.warning("WEBHOOK_SECRET environment variable is not set. Webhook signature verification is disabled.")
-if not CONTROL_REPO:
-    logger.warning("CONTROL_REPO environment variable is not set. Workflow triggering will fail.")
-if not BOT_USER_ID:
-    logger.warning("BOT_USER_ID environment variable is not set. Bot mention filtering will not work.")
+def is_processed(note_id: str) -> bool: return note_id in processed_cache
 
-# 用户验证函数
-def is_user_authorized(username: Optional[str]) -> bool:
-    """验证触发者是否在授权用户列表中。"""
-    if not username:
-        return False
-    if not ALLOWED_USERS:  # 如果ALLOWED_USERS为空，则允许所有用户
-        return True
-    return username in ALLOWED_USERS
+def mark_processed_disk(note_id: str):
+    # 内存占位已在 poll_loop 完成，此处仅负责持久化
+    with open(PROCESSED_LOG, "a") as f: f.write(f"{note_id}\n")
 
+# --- 数据提取 ---
 class TaskContext(BaseModel):
-    """从webhook事件中提取的上下文数据。"""
-    repo: str = Field(..., description="Repository full name (owner/repo)")
-    event_type: str = Field(..., description="GitHub event type")
-    event_id: str = Field(..., description="GitHub event ID")
-    trigger_user: Optional[str] = Field(None, description="User who triggered the event")
-    issue_number: Optional[int] = Field(None, description="Issue/PR number if applicable")
-    comment_body: Optional[str] = Field(None, description="Comment body if applicable")
-    pr_title: Optional[str] = Field(None, description="PR/Issue title if applicable")
-    pr_body: Optional[str] = Field(None, description="PR body if applicable")
-    pr_diff_url: Optional[str] = Field(None, description="PR diff URL if applicable")
-    discussion_title: Optional[str] = Field(None, description="Discussion title if applicable")
-    discussion_body: Optional[str] = Field(None, description="Discussion body if applicable")
-    # 新增字段
-    issue_body: Optional[str] = Field(None, description="Issue body content")
-    comments_history: Optional[list] = Field(None, description="List of comments with timestamps")
-    reviews_history: Optional[list] = Field(None, description="List of reviews with timestamps")
-    review_comments_batch: Optional[list] = Field(None, description="Batch of review comments for specific review")
-    current_comment_id: Optional[int] = Field(None, description="Current comment ID if applicable")
-    current_review_id: Optional[int] = Field(None, description="Current review ID if applicable")
-    is_mention_in_body: Optional[bool] = Field(None, description="Whether bot is mentioned in issue/PR body")
-    is_mention_in_review: Optional[bool] = Field(None, description="Whether bot is mentioned in review body")
-    is_truncated: Optional[bool] = Field(None, description="Whether context was truncated due to length limits")
+    repo: str
+    event_type: str
+    event_id: str
+    trigger_user: Optional[str] = None
+    issue_number: Optional[int] = None
+    commit_sha: Optional[str] = None
+    issue_body: Optional[str] = None
+    clone_url: Optional[str] = None
+    head_ref: Optional[str] = None
+    base_ref: Optional[str] = None
+    latest_comment_url: Optional[str] = None # 新增：用于追溯具体提及
 
-    def to_json_string(self) -> str:
-        """Convert context to JSON string for passing to workflow."""
-        return json.dumps(self.model_dump(), ensure_ascii=False)
+async def fetch_discussion_by_node(client: httpx.AsyncClient, node_id: str):
+    query = "query($id:ID!){node(id:$id){...on Discussion{body number author{login}url}}}"
+    resp = await client.post(GITHUB_GRAPHQL, json={"query": query, "variables": {"id": node_id}}, headers=user_graphql_headers)
+    return resp.json().get("data", {}).get("node") if resp.status_code == 200 else None
 
-def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool:
-    """验证GitHub webhook签名。"""
-    if not WEBHOOK_SECRET:
-        logger.warning("WEBHOOK_SECRET not set, skipping signature verification")
-        return True
-    
-    try:
-        hash_object = hmac.new(
-            WEBHOOK_SECRET.encode(),
-            msg=payload_body,
-            digestmod=hashlib.sha256
-        )
-        expected_signature = f"sha256={hash_object.hexdigest()}"
-        return hmac.compare_digest(expected_signature, signature_header)
-    except Exception as e:
-        logger.error(f"Error verifying signature: {e}")
-        return False
-
-async def fetch_issue_comments(repo: str, issue_number: int) -> list:
-    """获取issue/PR的所有评论。"""
-    url = f"{GITHUB_API}/repos/{repo}/issues/{issue_number}/comments"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, headers=headers, timeout=30.0)
-            response.raise_for_status()
-            comments = response.json()
-            # 按创建时间排序，最早的在前
-            sorted_comments = sorted(comments, key=lambda x: x.get("created_at", ""))
-            return sorted_comments
-        except Exception as e:
-            logger.error(f"Error fetching comments for {repo}#{issue_number}: {e}")
-            return []
-
-async def fetch_pr_reviews(repo: str, pr_number: int) -> list:
-    """获取PR的所有review。"""
-    url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/reviews"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, headers=headers, timeout=30.0)
-            response.raise_for_status()
-            reviews = response.json()
-            # 按提交时间排序，最早的在前
-            sorted_reviews = sorted(reviews, key=lambda x: x.get("submitted_at", ""))
-            return sorted_reviews
-        except Exception as e:
-            logger.error(f"Error fetching reviews for {repo}#{pr_number}: {e}")
-            return []
-
-async def fetch_specific_review_comments(repo: str, pr_number: int, review_id: int) -> list:
-    """获取特定review_id下的所有行内评论。"""
-    url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/reviews/{review_id}/comments"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, headers=headers, timeout=30.0)
-            response.raise_for_status()
-            comments = response.json()
-            # 按时间排序，最早的在前
-            sorted_comments = sorted(comments, key=lambda x: x.get("created_at", ""))
-            return sorted_comments
-        except Exception as e:
-            logger.error(f"Error fetching specific review comments for review {review_id}: {e}")
-            return []
-
-def truncate_context_by_chars(items: list, max_chars: int) -> tuple[list, bool]:
-    """
-    3新1老比例抓取 + 超限撤销 + 单边终止算法
-    items: 按时间正序排列（索引0是最老，索引-1是最新）
-    """
-    if not items:
-        return [], False
-
-    selected_indices = set()
-    total_chars = 0
-
-    left_ptr = 0
-    right_ptr = len(items) - 1
-
-    left_active = True   # 老评论端状态
-    right_active = True  # 新评论端状态
-
-    while left_ptr <= right_ptr and (left_active or right_active):
-        # --- 尝试抓取新评论 (最多3条) ---
-        for _ in range(3):
-            if right_active and left_ptr <= right_ptr:
-                item_text = str(items[right_ptr])
-                if total_chars + len(item_text) <= max_chars:
-                    selected_indices.add(right_ptr)
-                    total_chars += len(item_text)
-                    right_ptr -= 1
-                else:
-                    # 关键逻辑：撤销本次添加并锁死右侧
-                    right_active = False
-                    break
-
-        # --- 尝试抓取老评论 (最多1条) ---
-        if left_active and left_ptr <= right_ptr:
-            item_text = str(items[left_ptr])
-            if total_chars + len(item_text) <= max_chars:
-                selected_indices.add(left_ptr)
-                total_chars += len(item_text)
-                left_ptr += 1
-            else:
-                # 关键逻辑：撤销本次添加并锁死左侧
-                left_active = False
-
-    # --- 后序处理：排序并生成结果 ---
-    sorted_indices = sorted(list(selected_indices))
-    result = []
-
-    for i in range(len(sorted_indices)):
-        idx = sorted_indices[i]
-        result.append(items[idx])
-
-        # 插入截断声明 (Gap Notice)
-        if i < len(sorted_indices) - 1:
-            next_idx = sorted_indices[i+1]
-            if next_idx > idx + 1:
-                omitted = next_idx - idx - 1
-                result.append(json.dumps({
-                    "type": "system_notice",
-                    "content": f"--- [此处省略了中间 {omitted} 条历史评论] ---"
-                }))
-
-    is_truncated = len(selected_indices) < len(items)
-    return result, is_truncated
-
-
-def merge_and_sort_timeline(comments: list, reviews: list) -> list:
-    """
-    将评论和review合并为统一的时间线，按时间排序。
-
-    Args:
-        comments: issue/pr评论列表，每个元素是dict，包含created_at
-        reviews: review列表，每个元素是dict，包含submitted_at
-
-    Returns:
-        按时间排序的合并列表，每个元素添加了type字段用于区分来源
-    """
-    # 标记数据来源类型
-    comments_with_type = [{"type": "comment", **c} for c in comments]
-    reviews_with_type = [{"type": "review", **r} for r in reviews]
-
-    # 合并列表
-    merged = comments_with_type + reviews_with_type
-
-    # 按时间排序（最早的在前）
-    # comment使用created_at，review使用submitted_at
-    def get_timestamp(item):
-        if item.get("type") == "comment":
-            return item.get("created_at", "")
-        else:
-            return item.get("submitted_at", "")
-
-    sorted_merged = sorted(merged, key=get_timestamp)
-    return sorted_merged
-
-
-def prepare_items_for_truncation(comments: list, reviews: list) -> list:
-    """
-    准备评论和review数据，转换为统一格式用于截断。
-
-    Args:
-        comments: 从GitHub API获取的评论列表
-        reviews: 从GitHub API获取的review列表
-
-    Returns:
-        格式化后的项目列表，每个元素是JSON字符串
-    """
-    comment_items = [
-        {
-            "id": c.get("id"),
-            "user": c.get("user", {}).get("login"),
-            "body": c.get("body"),
-            "created_at": c.get("created_at")
-        }
-        for c in comments
-    ]
-
-    review_items = [
-        {
-            "id": r.get("id"),
-            "user": r.get("user", {}).get("login"),
-            "body": r.get("body"),
-            "state": r.get("state"),
-            "submitted_at": r.get("submitted_at")
-        }
-        for r in reviews
-    ]
-
-    return merge_and_sort_timeline(comment_items, review_items)
-
-
-def process_merged_timeline(truncated_items: list) -> tuple[list, list]:
-    """
-    处理截断后的时间线，按类型分离回comments_history和reviews_history。
-
-    Args:
-        truncated_items: 截断后的合并时间线列表
-
-    Returns:
-        (comments_history, reviews_history) 元组
-    """
-    comments_history = []
-    reviews_history = []
-
-    for item in truncated_items:
-        # Skip system_notice items
-        if isinstance(item, str) and "system_notice" in item:
-            parsed = json.loads(item)
-            if parsed.get("type") == "system_notice":
-                continue
-
-        parsed = item if isinstance(item, dict) else json.loads(item)
-
-        if parsed.get("type") == "comment":
-            # 移除type字段后存储
-            parsed.pop("type", None)
-            comments_history.append(parsed)
-        elif parsed.get("type") == "review":
-            parsed.pop("type", None)
-            reviews_history.append(parsed)
-
-    return comments_history, reviews_history
-
-async def extract_context_from_event(event_type: str, payload: Dict[str, Any], event_id: str = "") -> TaskContext:
-    """从GitHub webhook负载中提取相关上下文，包括历史数据。"""
-    repo = payload.get("repository", {}).get("full_name", "")
-
+# --- 核心处理 ---
+async def handle_note(client: httpx.AsyncClient, note: Dict):
+    repo_full = note["repository"]["full_name"]
+    subject = note["subject"]
+    note_id = note["id"]
     context = TaskContext(
-        repo=repo,
-        event_type=event_type,
-        event_id=event_id
+        repo=repo_full, 
+        event_type=subject["type"].lower(), 
+        event_id=note_id,
+        latest_comment_url=subject.get("latest_comment_url")
     )
 
-    # Extract based on event type
     try:
-        if event_type == "issues":
-            issue = payload.get("issue", {})
-            context.issue_number = issue.get("number")
-            context.trigger_user = issue.get("user", {}).get("login")
-            context.comment_body = issue.get("body")
-            context.pr_title = issue.get("title")  # issues也有title字段
-            context.issue_body = issue.get("body")
+        # 场景 A: Discussion (增强触发者识别)
+        if subject["type"] == "Discussion":
+            thread_resp = await client.get(note["url"], headers=user_rest_headers)
+            node_id = thread_resp.json().get("subject", {}).get("node_id")
+            if node_id:
+                data = await fetch_discussion_by_node(client, node_id)
+                if data:
+                    context.issue_body, context.issue_number = data["body"][:3000], data["number"]
+                    context.trigger_user = data["author"]["login"] # 默认讨论发起者
+                    
+                    # 优化：如果有最新评论 URL，尝试抓取具体的评论人作为触发者
+                    if context.latest_comment_url:
+                        lc_resp = await client.get(context.latest_comment_url, headers=user_rest_headers)
+                        if lc_resp.status_code == 200:
+                            context.trigger_user = lc_resp.json().get("author", {}).get("login") or context.trigger_user
+                    
+                    context.clone_url = note["repository"]["html_url"] + ".git"
 
-            # 检查是否在body中提及机器人
-            body_text = issue.get("body", "")
-            context.is_mention_in_body = any(mention in body_text for mention in BOT_MENTIONS) if body_text else False
+        # 场景 B: Issue / PR
+        elif subject["type"] in ["Issue", "PullRequest"]:
+            detail_resp = await client.get(subject["url"], headers=user_rest_headers)
+            if detail_resp.status_code == 200:
+                detail = detail_resp.json()
+                context.issue_number = detail.get("number")
+                context.issue_body = (detail.get("body") or "")[:3000]
+                context.trigger_user = detail.get("user", {}).get("login")
 
-        elif event_type == "issue_comment":
-            issue = payload.get("issue", {})
-            comment = payload.get("comment", {})
-            context.issue_number = issue.get("number")
-            context.trigger_user = comment.get("user", {}).get("login")
-            context.comment_body = comment.get("body")
-            context.pr_title = issue.get("title")
-            context.current_comment_id = comment.get("id")
+                # 如果有评论 URL，更新触发者为最后一个评论的人（即艾特你的人）
+                if context.latest_comment_url:
+                    lc_resp = await client.get(context.latest_comment_url, headers=user_rest_headers)
+                    if lc_resp.status_code == 200:
+                        context.trigger_user = lc_resp.json().get("user", {}).get("login") or context.trigger_user
 
-            # 获取issue body
-            context.issue_body = issue.get("body")
+                if subject["type"] == "PullRequest":
+                    context.clone_url = detail.get("head", {}).get("repo", {}).get("clone_url")
+                    context.head_ref, context.base_ref = detail.get("head", {}).get("ref"), detail.get("base", {}).get("ref")
+                else:
+                    context.clone_url = note["repository"]["html_url"] + ".git"
 
-            # 检查是否在body中提及机器人
-            body_text = issue.get("body", "")
-            context.is_mention_in_body = any(mention in body_text for mention in BOT_MENTIONS) if body_text else False
+        # 场景 C: Commit
+        elif subject["type"] == "Commit":
+            context.clone_url, context.commit_sha = note["repository"]["html_url"] + ".git", subject["url"].split("/")[-1]
+            comm_resp = await client.get(f"{subject['url']}/comments", headers=user_rest_headers)
+            if comm_resp.status_code == 200 and comm_resp.json():
+                context.trigger_user = comm_resp.json()[-1]["user"]["login"]
 
-            # 获取评论历史并截断
-            if context.issue_number:
-                all_comments = await fetch_issue_comments(repo, context.issue_number)
-                if all_comments:
-                    # 提取评论文本用于截断
-                    comment_texts = []
-                    for c in all_comments:
-                        comment_data = {
-                            "id": c.get("id"),
-                            "user": c.get("user", {}).get("login"),
-                            "body": c.get("body"),
-                            "created_at": c.get("created_at")
-                        }
-                        comment_texts.append(json.dumps(comment_data))
+        if ALLOWED_USERS and context.trigger_user not in ALLOWED_USERS: return
+        await trigger_workflow(context)
 
-                    truncated, is_truncated_flag = truncate_context_by_chars(comment_texts, CONTEXT_MAX_CHARS)
-                    # 解析回结构化数据
-                    context.comments_history = [json.loads(item) for item in truncated]
-                    # 更新截断标志
-                    context.is_truncated = context.is_truncated or is_truncated_flag
-
-        elif event_type == "pull_request":
-            pr = payload.get("pull_request", {})
-            context.issue_number = pr.get("number")
-            context.trigger_user = pr.get("user", {}).get("login")
-            context.pr_title = pr.get("title")
-            context.pr_body = pr.get("body")
-            # GitHub webhook payload中的diff_url可能不存在, construct from html_url
-            html_url = pr.get("html_url")
-            context.pr_diff_url = pr.get("diff_url")
-            if not context.pr_diff_url and html_url:
-                context.pr_diff_url = f"{html_url}.diff"
-
-            # 检查是否在body中提及机器人
-            body_text = pr.get("body", "")
-            context.is_mention_in_body = any(mention in body_text for mention in BOT_MENTIONS) if body_text else False
-
-        elif event_type == "pull_request_review":
-            pr = payload.get("pull_request", {})
-            review = payload.get("review", {})
-            context.issue_number = pr.get("number")
-            context.trigger_user = review.get("user", {}).get("login")
-            context.comment_body = review.get("body")
-            context.pr_title = pr.get("title")
-            context.current_review_id = review.get("id")
-
-            # 获取PR body
-            context.pr_body = pr.get("body")
-
-            # 检查是否在body中提及机器人
-            body_text = pr.get("body", "")
-            context.is_mention_in_body = any(mention in body_text for mention in BOT_MENTIONS) if body_text else False
-
-            # 检查是否在review body中提及机器人
-            review_body = review.get("body", "")
-            context.is_mention_in_review = any(mention in review_body for mention in BOT_MENTIONS) if review_body else False
-
-            # 检查webhook action，只处理"submitted"动作，避免重复触发
-            action = payload.get("action", "")
-            if action == "submitted" and context.is_mention_in_review:
-                # 机器人被提及在当前review中，获取该批次的详细评论
-                if context.issue_number and context.current_review_id:
-                    batch_comments = await fetch_specific_review_comments(
-                        repo, context.issue_number, context.current_review_id
-                    )
-                    if batch_comments:
-                        context.review_comments_batch = []
-                        for c in batch_comments:
-                            comment_data = {
-                                "id": c.get("id"),
-                                "user": c.get("user", {}).get("login"),
-                                "body": c.get("body"),
-                                "path": c.get("path"),
-                                "position": c.get("position"),
-                                "created_at": c.get("created_at")
-                            }
-                            context.review_comments_batch.append(comment_data)
-
-            # 获取所有相关数据（issue评论、review历史）并合并为统一时间线
-            if context.issue_number:
-                # 获取issue/PR评论
-                all_comments = await fetch_issue_comments(repo, context.issue_number)
-                # 获取review历史
-                all_reviews = await fetch_pr_reviews(repo, context.issue_number)
-
-                if all_comments or all_reviews:
-                    # 准备统一格式的数据并合并为时间线
-                    merged_timeline = prepare_items_for_truncation(all_comments, all_reviews)
-
-                    # 统一截断
-                    truncated, is_truncated_flag = truncate_context_by_chars(merged_timeline, CONTEXT_MAX_CHARS)
-
-                    # 解析回结构化数据，按类型分开存储
-                    context.comments_history, context.reviews_history = process_merged_timeline(truncated)
-
-                    # 更新截断标志
-                    context.is_truncated = context.is_truncated or is_truncated_flag
-
-        elif event_type == "pull_request_review_comment":
-            pr = payload.get("pull_request", {})
-            comment = payload.get("comment", {})
-            context.issue_number = pr.get("number")
-            context.trigger_user = comment.get("user", {}).get("login")
-            context.comment_body = comment.get("body")
-            context.pr_title = pr.get("title")
-            context.current_comment_id = comment.get("id")
-
-            # 获取PR body
-            context.pr_body = pr.get("body")
-
-            # 检查是否在body中提及机器人
-            body_text = pr.get("body", "")
-            context.is_mention_in_body = any(mention in body_text for mention in BOT_MENTIONS) if body_text else False
-
-            # 检查是否在当前评论中提及机器人
-            comment_text = comment.get("body", "")
-            is_mention_in_comment = any(mention in comment_text for mention in BOT_MENTIONS) if comment_text else False
-
-            # 获取评论历史和review历史，合并为统一时间线后截断
-            if context.issue_number and is_mention_in_comment:
-                # 获取PR评论
-                all_comments = await fetch_issue_comments(repo, context.issue_number)
-                # 获取review历史
-                all_reviews = await fetch_pr_reviews(repo, context.issue_number)
-
-                if all_comments or all_reviews:
-                    # 准备统一格式的数据并合并为时间线
-                    merged_timeline = prepare_items_for_truncation(all_comments, all_reviews)
-
-                    # 统一截断
-                    truncated, is_truncated_flag = truncate_context_by_chars(merged_timeline, CONTEXT_MAX_CHARS)
-
-                    # 解析回结构化数据，按类型分开存储
-                    context.comments_history, context.reviews_history = process_merged_timeline(truncated)
-
-                    # 更新截断标志
-                    context.is_truncated = context.is_truncated or is_truncated_flag
-
-        elif event_type == "discussion":
-            discussion = payload.get("discussion", {})
-            context.trigger_user = discussion.get("user", {}).get("login")
-            context.discussion_title = discussion.get("title")
-            context.discussion_body = discussion.get("body")
     except Exception as e:
-        logger.error(f"Error extracting context from {event_type} event: {e}")
+        logger.error(f"Error: {e}")
 
-    return context
-
-def generate_task_description(event_type: str, context: TaskContext) -> str:
-    """根据事件类型生成自然语言任务描述。"""
-    if event_type == "pull_request":
-        title_suffix = f" - {context.pr_title}" if context.pr_title else ""
-        return f"Review PR #{context.issue_number}{title_suffix} in {context.repo} and provide feedback or code improvements."
-    elif event_type == "pull_request_review":
-        return f"Review the review comment on PR #{context.issue_number} in {context.repo} and respond appropriately."
-    elif event_type == "pull_request_review_comment":
-        if context.comment_body and any(mention in context.comment_body for mention in BOT_MENTIONS):
-            return f"Respond to review comment on PR #{context.issue_number} in {context.repo}."
-        # Only process comments that mention the bot, otherwise return a skip indicator
-        return f"SKIP: Review comment on PR #{context.issue_number} in {context.repo} does not mention the bot."
-    elif event_type == "issue_comment":
-        if context.comment_body and any(mention in context.comment_body for mention in BOT_MENTIONS):
-            return f"Respond to comment on issue #{context.issue_number} in {context.repo}."
-        # Only process comments that mention the bot, otherwise return a skip indicator
-        return f"SKIP: Comment on issue #{context.issue_number} in {context.repo} does not mention the bot."
-    elif event_type == "issues":
-        title_suffix = f" - {context.pr_title}" if context.pr_title else ""
-        return f"Analyze new issue #{context.issue_number}{title_suffix} in {context.repo} and provide initial response."
-    elif event_type == "discussion":
-        return f"Participate in discussion '{context.discussion_title}' in {context.repo}."
-    else:
-        return f"Handle {event_type} event in {context.repo}."
-
-async def trigger_workflow_dispatch(task: str, context: TaskContext):
-    """在控制仓库中触发 workflow_dispatch 事件。"""
-    # Skip if task starts with "SKIP:"
-    if task.startswith("SKIP:"):
-        logger.info(f"Skipping workflow dispatch: {task}")
-        return True
+async def trigger_workflow(ctx: TaskContext):
+    payload_str = ctx.model_dump_json()
+    if len(payload_str) > 60000:
+        ctx.issue_body = ctx.issue_body[:500] + "..."
+        payload_str = ctx.model_dump_json()
 
     url = f"{GITHUB_API}/repos/{CONTROL_REPO}/actions/workflows/llm-bot-runner.yml/dispatches"
-
-    payload = {
-        "ref": "main",
-        "inputs": {
-            "task": task,
-            "context": context.to_json_string()
-        }
-    }
-
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, headers=headers, json=payload, timeout=30.0)
-            response.raise_for_status()
-            logger.info(f"Workflow dispatch triggered successfully: {response.status_code}")
-            return True
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error triggering workflow: {e.response.status_code} - {e.response.text}")
-            return False
-        except Exception as e:
-            logger.error(f"Error triggering workflow: {e}")
-            return False
+        r = await client.post(url, headers=user_rest_headers, json={"ref": "main", "inputs": {"task": "AI_TASK", "context": payload_str}})
+        if r.status_code == 204:
+            await client.patch(f"{GITHUB_API}/notifications/threads/{ctx.event_id}", headers=bot_headers)
+            mark_processed_disk(ctx.event_id)
+            logger.info(f"Done: {ctx.event_id}")
 
-@app.post("/webhook")
-async def github_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_hub_signature_256: Optional[str] = Header(None),
-    x_github_event: Optional[str] = Header(None),
-    x_github_delivery: Optional[str] = Header(None)
-):
-    """GitHub webhooks 端点。"""
-    # 读取原始请求体用于签名验证
-    body_bytes = await request.body()
-    
-    # 如果配置了密钥则验证签名
-    if x_hub_signature_256 and not verify_webhook_signature(body_bytes, x_hub_signature_256):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-    
-    # 解析JSON负载
-    try:
-        payload = await request.json()
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-    
-    event_type = x_github_event or "unknown"
-    logger.info(f"Received {event_type} event for {payload.get('repository', {}).get('full_name', 'unknown')}")
-    
-    # 从负载中提取上下文
-    event_id = x_github_delivery or ""
-    context = await extract_context_from_event(event_type, payload, event_id)
+async def poll_loop():
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            try:
+                curr_headers = bot_headers.copy()
+                if state["last_modified"]: curr_headers["If-Modified-Since"] = state["last_modified"]
+                resp = await client.get(f"{GITHUB_API}/notifications", headers=curr_headers, params={"all": "false"})
+                state["poll_interval"] = int(resp.headers.get("X-Poll-Interval", 60))
+                
+                if resp.status_code == 200:
+                    state["last_modified"] = resp.headers.get("Last-Modified")
+                    for note in resp.json():
+                        # 核心修复 1：立即执行内存占位，防止异步并发导致重复触发
+                        if note["reason"] in ["mention", "team_mention"] and not is_processed(note["id"]):
+                            processed_cache.add(note["id"]) 
+                            asyncio.create_task(handle_note(client, note))
+                elif resp.status_code == 304: pass
+            except Exception as e: logger.error(f"Poll Error: {e}")
+            await asyncio.sleep(state["poll_interval"])
 
-    # 验证触发者权限
-    if not is_user_authorized(context.trigger_user):
-        logger.warning(f"User {context.trigger_user} is not authorized to trigger bot")
-        return {
-            "status": "rejected",
-            "event": event_type,
-            "repo": context.repo,
-            "reason": f"User {context.trigger_user} is not in allowed list",
-            "allowed_users": ALLOWED_USERS
-        }
-
-    # 生成任务描述
-    task = generate_task_description(event_type, context)
-
-    # 在后台触发工作流
-    background_tasks.add_task(trigger_workflow_dispatch, task, context)
-
-    return {
-        "status": "processing",
-        "event": event_type,
-        "repo": context.repo,
-        "task": task
-    }
-
-@app.get("/health")
-async def health_check():
-    """健康检查端点。"""
-    return {"status": "healthy", "service": "llm-bot-webhook-server"}
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+@app.on_event("startup")
+async def startup():
+    load_processed_log()
+    asyncio.create_task(poll_loop())
