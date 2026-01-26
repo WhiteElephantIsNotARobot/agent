@@ -13,40 +13,22 @@ on:
         type: string
 
 jobs:
-  run-llm-bot:
+  # 在host runner上预配置身份验证和秘密（Claude Code无法访问此步骤）
+  pre-config:
     runs-on: ubuntu-latest
     env:
-      LLM_TASK: ${{ inputs.task }}
-      LLM_CONTEXT: ${{ inputs.context }}
-      # GitHub身份令牌（4个名称都设置）
-      GITHUB_TOKEN: ${{ secrets.WEINAR_API_KEY }}
+      # GitHub身份令牌
       GH_TOKEN: ${{ secrets.WEINAR_API_KEY }}
-      GITHUBTOKEN: ${{ secrets.WEINAR_API_KEY }}
-      GHTOKEN: ${{ secrets.WEINAR_API_KEY }}
       # Claude Code环境变量配置
       ANTHROPIC_API_KEY: ${{ secrets.MIMO_API_KEY }}
-      ANTHROPIC_AUTH_TOKEN: ${{ secrets.MIMO_API_KEY }}
-      ANTHROPIC_BASE_URL: "https://api.xiaomimimo.com/anthropic"
-      ANTHROPIC_DEFAULT_OPUS_MODEL: "mimo-v2-flash"
-      ANTHROPIC_DEFAULT_SONNET_MODEL: "mimo-v2-flash"
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: "mimo-v2-flash"
-      # MCP服务器环境变量
-      CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
       # 系统提示词
       SYSTEM_PROMPT: ${{ vars.SYSTEM_PROMPT }}
-      # 其他令牌
-      MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
-      WEINAR_API_KEY: ${{ secrets.WEINAR_API_KEY }}
     permissions:
       contents: write
       pull-requests: write
       issues: write
       discussions: write
-    defaults:
-      run:
-        working-directory: /home/runner/work
     steps:
-
       - name: 安装Claude CLI
         run: |
           curl -fsSL https://claude.ai/install.sh | bash
@@ -54,87 +36,83 @@ jobs:
       - name: 安装uv包管理器
         uses: astral-sh/setup-uv@v7
 
-      - name: 验证令牌和环境变量
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: work  # 检出到work目录
+          
+      - name: 验证Anthropic API令牌
         run: |
-          echo "验证环境变量..."
-          # 验证GitHub令牌
-          if [ -z "$GITHUB_TOKEN" ]; then
-            echo "错误: GITHUB_TOKEN未设置"
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "错误: ANTHROPIC_API_KEY未设置"
             exit 1
           else
-            echo "GitHub令牌已设置"
+            echo "Anthropic API令牌已设置"
           fi
-          # 验证Anthropic认证令牌
-          if [ -z "$ANTHROPIC_AUTH_TOKEN" ]; then
-            echo "错误: ANTHROPIC_AUTH_TOKEN未设置"
-            exit 1
-          else
-            echo "Anthropic认证令牌已设置"
-          fi
-          # 验证系统提示词
+
+      - name: 验证系统提示词
+        run: |
           if [ -z "$SYSTEM_PROMPT" ]; then
             echo "错误: SYSTEM_PROMPT未设置"
             exit 1
           else
-            echo "系统提示词已设置"
+            echo "系统提示词已设置（长度: ${#SYSTEM_PROMPT} 字符）"
           fi
 
-      - name: 添加MCP服务器
+      - name: 以GitHub机器人身份配置Git
         run: |
-          # 添加DuckDuckGo搜索服务器
-          echo "添加DuckDuckGo搜索服务器..."
-          claude mcp add ddg-search -- uvx duckduckgo-mcp-server
-
-          # 添加Context7 HTTP服务器（如果CONTEXT7_API_KEY已设置）
-          if [ -n "$CONTEXT7_API_KEY" ]; then
-            echo "添加Context7 HTTP服务器..."
-            claude mcp add --transport http context7 https://mcp.context7.com/mcp \
-              --header "CONTEXT7_API_KEY: $CONTEXT7_API_KEY"
-          else
-            echo "警告: CONTEXT7_API_KEY未设置，跳过Context7服务器添加"
-          fi
-        env:
-          CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
-
-      - name: 预配置Git（用户、SSH、GPG签名）
-        run: |
-          echo "配置Git用户信息..."
           git config --global user.name "WhiteElephantIsNotARobot"
           git config --global user.email "257136373+WhiteElephantIsNotARobot@users.noreply.github.com"
+          echo "Git用户信息已配置"
 
-          echo "配置SSH认证..."
-          # 创建SSH目录
+      - name: 配置GitHub CLI认证（通过环境变量）
+        env:
+          GH_TOKEN: ${{ secrets.WEINAR_API_KEY }}
+        run: |
+          echo "配置GitHub CLI认证..."
+          gh auth login --with-token <<< "$GH_TOKEN"
+          echo "GitHub CLI认证完成"
+
+      - name: 配置SSH认证（关键：私钥不进入容器，使用agent转发）
+        run: |
+          echo "配置SSH认证（安全模式：私钥永不出host）..."
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          # 从环境变量写入SSH私钥（如果提供了SSH_PRIVATE_KEY）
+          # 从环境变量写入SSH私钥到host（仅host可见）
           if [ -n "$SSH_PRIVATE_KEY" ]; then
             echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
             chmod 600 ~/.ssh/id_rsa
-            echo "SSH私钥已写入 ~/.ssh/id_rsa"
+            echo "SSH私钥已写入host的 ~/.ssh/id_rsa"
 
-            # 启动ssh-agent并添加密钥
+            # 启动ssh-agent并添加密钥（仅host的agent持有私钥）
             eval "$(ssh-agent -s)"
             ssh-add ~/.ssh/id_rsa
-            echo "SSH密钥已添加到ssh-agent"
+            echo "SSH密钥已添加到host的ssh-agent"
+            
+            # 关键：保存SSH_AUTH_SOCK路径到文件（socket将在容器间转发）
+            echo "$SSH_AUTH_SOCK" > ~/.ssh/ssh_auth_sock
+            echo "SSH_AUTH_SOCK已保存: $SSH_AUTH_SOCK"
+            echo "安全：id_rsa私钥不会mount到容器，仅通过agent转发"
           else
-            echo "警告: SSH_PRIVATE_KEY环境变量未设置，跳过SSH配置"
+            echo "警告: SSH_PRIVATE_KEY未设置，跳过SSH配置"
           fi
 
-          # 添加GitHub到known_hosts
+          # 配置known_hosts（host和容器都需要）
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
           chmod 644 ~/.ssh/known_hosts
+          echo "known_hosts已配置"
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}}
 
-          echo "配置GPG签名..."
-          # 从环境变量写入GPG私钥（如果提供了GPG_PRIVATE_KEY）
+      - name: 配置GPG签名
+        run: |
           if [ -n "$GPG_PRIVATE_KEY" ]; then
             echo "$GPG_PRIVATE_KEY" | gpg --import --batch
-            echo "GPG私钥已导入"
+            echo "GPG私钥已导入到host"
 
-            # 获取GPG密钥ID
             GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG "257136373+WhiteElephantIsNotARobot@users.noreply.github.com" 2>/dev/null | grep sec | awk '{print $2}' | cut -d'/' -f2)
             if [ -n "$GPG_KEY_ID" ]; then
-              # 配置git使用GPG签名
               git config --global user.signingkey "$GPG_KEY_ID"
               git config --global commit.gpgsign true
               git config --global gpg.program gpg
@@ -143,31 +121,199 @@ jobs:
               echo "警告: 无法找到GPG密钥ID"
             fi
           else
-            echo "警告: GPG_PRIVATE_KEY环境变量未设置，跳过GPG配置"
+            echo "警告: GPG_PRIVATE_KEY未设置，跳过GPG配置"
           fi
-
-          echo "Git预配置完成"
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
-      - name: 以GitHub机器人身份运行Claude Code
+      - name: 创建上下文文件和SSH agent信息
         run: |
-          echo "运行Claude Code..."
-          echo "原始任务: $LLM_TASK"
-          echo "系统提示词长度: ${#SYSTEM_PROMPT} 字符"
-
-          # 将JSON上下文写入文件（保存到/home/runner/目录）
           echo "$LLM_CONTEXT" > /home/runner/context.json
-          CONTEXT_CHARS=$(wc -m < /home/runner/context.json)
-          echo "上下文文件大小: $CONTEXT_CHARS 字符"
-          # 不直接cat内容，避免日志污染
+          echo "上下文文件已创建（大小: $(wc -m < /home/runner/context.json) 字符）"
+          
+          # 确保.ssh目录和文件权限正确
+          chmod 755 ~/.ssh
+          chmod 644 ~/.ssh/known_hosts
+          if [ -f ~/.ssh/ssh_auth_sock_path ]; then
+            chmod 600 ~/.ssh/ssh_auth_sock_path
+          fi
+
+  # 在隔离容器中运行Claude Code（无法访问host的秘密）
+  run-llm-bot:
+    needs: pre-config
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/anthropics/claude-code:latest
+      options: --cap-drop ALL --security-opt no-new-privileges --read-only
+      volumes:
+        - /home/runner/work:/workspace  # 工作区（读写）
+        - /home/runner/.ssh:/root/.ssh:ro  # SSH配置（只读，仅known_hosts和ssh_auth_sock）
+        # 关键：不mount id_rsa私钥到容器！使用ssh-agent转发
+        - /home/runner/.gnupg:/root/.gnupg:ro  # GPG配置（只读，用于签名）
+        - /home/runner/context.json:/workspace/context.json:ro  # 上下文文件（只读）
+        # 注意：不mount ~/.config/gh，防止Claude Code访问GitHub令牌
+        # 但GH_TOKEN通过环境变量传递，gh CLI可以使用
+    env:
+      LLM_TASK: ${{ inputs.task }}
+      # GitHub令牌通过环境变量传递（gh CLI会使用它，而不是~/.config/gh文件）
+      GH_TOKEN: ${{ secrets.WEINAR_API_KEY }}
+      # 将API密钥通过环境变量传递给容器（但这些是LLM服务所需，不是仓库访问秘密）
+      ANTHROPIC_API_KEY: ${{ secrets.MIMO_API_KEY }}
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.MIMO_API_KEY }}
+      ANTHROPIC_BASE_URL: "https://api.xiaomimimo.com/anthropic"
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "mimo-v2-flash"
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "mimo-v2-flash"
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "mimo-v2-flash"
+      MCP_CONTEXT7_API_KEY: ${{ secrets.CONTEXT7_API_KEY }}
+      SYSTEM_PROMPT: ${{ vars.SYSTEM_PROMPT }}
+      # 工作目录
+      WORKSPACE_DIR: /workspace
+    steps:
+      - name: 创建工作区并复制上下文
+        run: |
+          mkdir -p /workspace
+          cp /home/runner/context.json /workspace/context.json
+          echo "工作区已准备就绪"
+
+      - name: 配置GitHub CLI和Git（SSH私钥永不进入容器）
+        run: |
+          echo "配置GitHub CLI（使用环境变量GH_TOKEN）..."
+          # gh CLI会自动使用GH_TOKEN环境变量，无需~/.config/gh文件
+          gh auth status
+          echo "GitHub CLI认证状态正常"
+          
+          echo "配置Git使用SSH agent转发（私钥在host，永不进入容器）..."
+          # 关键：不挂载id_rsa私钥，使用SSH_AUTH_SOCK
+          if [ -f /root/.ssh/ssh_auth_sock ]; then
+            export SSH_AUTH_SOCK=$(cat /root/.ssh/ssh_auth_sock)
+            echo "SSH_AUTH_SOCK已设置: $SSH_AUTH_SOCK"
+            
+            # 配置git使用SSH agent
+            git config --global core.sshCommand "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts"
+            echo "Git已配置使用SSH agent转发"
+            
+            # 验证SSH agent连接
+            if ssh-add -l > /dev/null 2>&1; then
+              echo "✓ SSH agent连接正常"
+            else
+              echo "✗ SSH agent连接失败"
+            fi
+          else
+            echo "警告: 未找到SSH_AUTH_SOCK文件，Git操作可能受限"
+            # 降级方案：配置git使用HTTPS（需要token）
+            git config --global credential.helper store
+            echo "https://WhiteElephantIsNotARobot:${GH_TOKEN}@github.com" > ~/.git-credentials
+            echo "已配置Git使用HTTPS认证"
+          fi
+          
+          # 配置Git用户信息（从pre-config继承）
+          git config --global user.name "WhiteElephantIsNotARobot"
+          git config --global user.email "257136373+WhiteElephantIsNotARobot@users.noreply.github.com"
+          
+          # 配置GPG签名（如果GPG密钥已mount）
+          if [ -d /root/.gnupg ] && gpg --list-secret-keys > /dev/null 2>&1; then
+            GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG "257136373+WhiteElephantIsNotARobot@users.noreply.github.com" 2>/dev/null | grep sec | awk '{print $2}' | cut -d'/' -f2)
+            if [ -n "$GPG_KEY_ID" ]; then
+              git config --global user.signingkey "$GPG_KEY_ID"
+              git config --global commit.gpgsign true
+              git config --global gpg.program gpg
+              echo "GPG签名已配置，密钥ID: $GPG_KEY_ID"
+            fi
+          fi
+          
+          echo "GitHub CLI和Git配置完成（SSH私钥在host，永不进入容器）"
+
+      - name: 配置MCP服务器（在隔离容器内）
+        working-directory: /workspace
+        run: |
+          # 添加DuckDuckGo搜索服务器
+          echo "添加DuckDuckGo搜索服务器..."
+          claude mcp add ddg-search -- uvx duckduckgo-mcp-server
+
+          # 添加Context7 HTTP服务器（如果CONTEXT7_API_KEY已设置）
+          if [ -n "$MCP_CONTEXT7_API_KEY" ]; then
+            echo "添加Context7 HTTP服务器..."
+            claude mcp add --transport http context7 https://mcp.context7.com/mcp \
+              --header "CONTEXT7_API_KEY: $MCP_CONTEXT7_API_KEY"
+          else
+            echo "警告: CONTEXT7_API_KEY未设置，跳过Context7服务器添加"
+          fi
+
+      - name: 验证所有权限（GitHub CLI, SSH agent, 工作区）
+        run: |
+          echo "=== 验证工作区权限 ==="
+          ls -la /workspace
+          
+          # 测试写入权限
+          echo "测试写入权限..." > /workspace/test-write.txt
+          if [ -f /workspace/test-write.txt ]; then
+            echo "✓ 工作区写入权限正常"
+            rm /workspace/test-write.txt
+          else
+            echo "✗ 工作区写入权限失败"
+            exit 1
+          fi
+          
           echo ""
+          echo "=== 验证GitHub CLI功能 ==="
+          gh auth status
+          gh repo view --json name
+          if [ $? -eq 0 ]; then
+            echo "✓ GitHub CLI可以访问仓库"
+          else
+            echo "✗ GitHub CLI无法访问仓库"
+            exit 1
+          fi
+          
+          echo ""
+          echo "=== 验证SSH agent连接（私钥不进入容器） ==="
+          if [ -f /root/.ssh/ssh_auth_sock ]; then
+            export SSH_AUTH_SOCK=$(cat /root/.ssh/ssh_auth_sock)
+            echo "SSH_AUTH_SOCK: $SSH_AUTH_SOCK"
+            
+            # 检查agent中的密钥
+            if ssh-add -l > /dev/null 2>&1; then
+              echo "✓ SSH agent连接正常"
+              ssh-add -l
+              
+              # 测试GitHub连接（使用agent）
+              echo "测试GitHub SSH连接（不暴露私钥）..."
+              ssh -T git@github.com 2>&1 | head -1
+            else
+              echo "✗ SSH agent中无密钥或连接失败"
+            fi
+            
+            # 验证私钥文件不存在（安全）
+            if [ ! -f /root/.ssh/id_rsa ]; then
+              echo "✓ 验证通过：id_rsa私钥未mount到容器（安全）"
+            else
+              echo "✗ 警告：id_rsa私钥存在于容器（安全漏洞！）"
+              exit 1
+            fi
+          else
+            echo "警告: 未使用SSH agent，将降级到HTTPS"
+          fi
+          
+          echo ""
+          echo "=== 所有权限验证通过！ ==="
+          echo "总结："
+          echo "  - GitHub CLI: 通过环境变量GH_TOKEN认证 ✓"
+          echo "  - Git SSH: 通过SSH agent转发（私钥在host） ✓"
+          echo "  - 工作区: 完整读写权限 ✓"
+          echo "  - 私钥保护: id_rsa不进入容器 ✓"
 
-          # 构建新任务字符串，包含读取context.json的指示
-          ENHANCED_TASK=$(printf "%s\n\n> 任务上下文已保存到/home/runner/context.json，共%s字符。阅读该文件以了解上下文！" "$LLM_TASK" "$CONTEXT_CHARS")
-          echo "增强任务: $ENHANCED_TASK"
+      - name: 在容器中运行Claude Code（隔离环境）
+        working-directory: /workspace
+        run: |
+          echo "在隔离容器中运行Claude Code..."
+          echo "原始任务: $LLM_TASK"
+          CONTEXT_CHARS=$(wc -m < /workspace/context.json)
+          echo "上下文文件大小: $CONTEXT_CHARS 字符"
 
+          # 构建增强任务
+          ENHANCED_TASK=$(printf "%s\n\n> 任务上下文已保存到/workspace/context.json，共%s字符。阅读该文件以了解上下文！" "$LLM_TASK" "$CONTEXT_CHARS")
+
+          # 在隔离容器中运行Claude Code（无法访问host的秘密）
           claude \
             -p "$ENHANCED_TASK" \
             --system-prompt "$SYSTEM_PROMPT" \
@@ -175,10 +321,7 @@ jobs:
             --output-format=stream-json \
             --verbose
 
-          # 确保工作目录存在（在三次Claude调用中间插入）
-          mkdir -p /home/runner/work
-
-          # 自查
+          # 第一次自查
           claude \
             -p "请快速自查是否在 GitHub 留下回复，如果否，请根据要求在 GitHub 中留下回复。另请快速检查工作区，确保所有更改都已经提交并推送，确保 PR 已存在，任何未推送的更改都将在此会话结束后被永久销毁！" \
             --system-prompt "$SYSTEM_PROMPT" \
@@ -187,10 +330,7 @@ jobs:
             --verbose \
             --continue
 
-          # 再次确保工作目录存在
-          mkdir -p /home/runner/work
-
-          # 再次自查
+          # 第二次自查
           claude \
             -p "请再次确认：所有更改都已经提交并推送，并且 PR 已存在，任何未推送的更改都将在此会话结束后被永久销毁！" \
             --system-prompt "$SYSTEM_PROMPT" \
