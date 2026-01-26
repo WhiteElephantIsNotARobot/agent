@@ -42,6 +42,9 @@ jobs:
       pull-requests: write
       issues: write
       discussions: write
+    defaults:
+      run:
+        working-directory: /home/runner/work
     steps:
 
       - name: 安装Claude CLI
@@ -99,16 +102,15 @@ jobs:
           echo "原始任务: $LLM_TASK"
           echo "系统提示词长度: ${#SYSTEM_PROMPT} 字符"
 
-          # 将JSON上下文写入文件
-          echo "$LLM_CONTEXT" > context.json
-          CONTEXT_CHARS=$(wc -m < context.json)
+          # 将JSON上下文写入文件（保存到/home/runner/目录）
+          echo "$LLM_CONTEXT" > /home/runner/context.json
+          CONTEXT_CHARS=$(wc -m < /home/runner/context.json)
           echo "上下文文件大小: $CONTEXT_CHARS 字符"
-          echo "上下文内容:"
-          cat context.json
+          # 不直接cat内容，避免日志污染
           echo ""
 
           # 构建新任务字符串，包含读取context.json的指示
-          ENHANCED_TASK=$(printf "%s\n\n> 任务上下文已保存，共%s字符。阅读context.json文件以了解上下文！" "$LLM_TASK" "$CONTEXT_CHARS")
+          ENHANCED_TASK=$(printf "%s\n\n> 任务上下文已保存到/home/runner/context.json，共%s字符。阅读该文件以了解上下文！" "$LLM_TASK" "$CONTEXT_CHARS")
           echo "增强任务: $ENHANCED_TASK"
 
           claude \
@@ -118,6 +120,9 @@ jobs:
             --output-format=stream-json \
             --verbose
 
+          # 确保工作目录存在（在三次Claude调用中间插入）
+          mkdir -p /home/runner/work
+
           # 自查
           claude \
             -p "请快速自查是否在 GitHub 留下回复，如果否，请根据要求在 GitHub 中留下回复。另请快速检查工作区，确保所有更改都已经提交并推送，确保 PR 已存在，任何未推送的更改都将在此会话结束后被永久销毁！" \
@@ -126,6 +131,9 @@ jobs:
             --output-format=stream-json \
             --verbose \
             --continue
+
+          # 再次确保工作目录存在
+          mkdir -p /home/runner/work
 
           # 再次自查
           claude \
