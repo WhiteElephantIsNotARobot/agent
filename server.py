@@ -171,13 +171,14 @@ def truncate_context_by_chars(items: List[TimelineItem], max_chars: int) -> Tupl
     is_truncated = len(selected_indices) < len(items)
     return result, is_truncated
 
-def merge_and_sort_timeline(comments: List[Dict], reviews: List[Dict]) -> List[TimelineItem]:
+def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
     """
-    将评论和review合并为统一的时间线，按时间排序。
+    从PR资源数据中提取所有时间线项目
     """
     timeline = []
 
-    # 添加评论
+    # 1. 普通评论（Issue评论）
+    comments = resource_data.get("comments", {}).get("nodes", [])
     for c in comments:
         if c.get("body"):
             timeline.append(TimelineItem(
@@ -188,7 +189,8 @@ def merge_and_sort_timeline(comments: List[Dict], reviews: List[Dict]) -> List[T
                 type="comment"
             ))
 
-    # 添加审核
+    # 2. 审核
+    reviews = resource_data.get("reviews", {}).get("nodes", [])
     for r in reviews:
         if r.get("body"):
             timeline.append(TimelineItem(
@@ -200,22 +202,41 @@ def merge_and_sort_timeline(comments: List[Dict], reviews: List[Dict]) -> List[T
                 state=r.get("state")
             ))
 
-        # 添加审核评论
-        if r.get("comments") and r["comments"].get("nodes"):
-            for rc in r["comments"]["nodes"]:
-                if rc.get("body"):
-                    timeline.append(TimelineItem(
-                        id=str(rc.get("id", "")),
-                        body=rc.get("body", ""),
-                        created_at=rc.get("created_at", ""),
-                        user=rc.get("author", {}).get("login", "unknown"),
-                        type="review_comment",
-                        path=rc.get("path"),
-                        diff_hunk=rc.get("diffHunk"),
-                        review_id=str(r.get("id", ""))
-                    ))
+    # 3. 审核评论（行内代码评论）- 从reviewThreads获取
+    review_threads = resource_data.get("reviewThreads", {}).get("nodes", [])
+    for thread in review_threads:
+        thread_comments = thread.get("comments", {}).get("nodes", [])
+        for rc in thread_comments:
+            if rc.get("body"):
+                timeline.append(TimelineItem(
+                    id=str(rc.get("id", "")),
+                    body=rc.get("body", ""),
+                    created_at=rc.get("created_at", ""),
+                    user=rc.get("author", {}).get("login", "unknown"),
+                    type="review_comment",
+                    path=rc.get("path"),
+                    diff_hunk=rc.get("diffHunk"),
+                    review_id=str(rc.get("pullRequestReview", {}).get("id", "")) if rc.get("pullRequestReview") else None
+                ))
 
     # 按时间排序
+    timeline.sort(key=lambda x: x.created_at)
+    return timeline
+
+def merge_comments_to_timeline(comments: List[Dict]) -> List[TimelineItem]:
+    """
+    将评论列表转换为时间线项目
+    """
+    timeline = []
+    for c in comments:
+        if c.get("body"):
+            timeline.append(TimelineItem(
+                id=str(c.get("id", "")),
+                body=c.get("body", ""),
+                created_at=c.get("created_at", ""),
+                user=c.get("author", {}).get("login", "unknown"),
+                type="comment"
+            ))
     timeline.sort(key=lambda x: x.created_at)
     return timeline
 
@@ -230,12 +251,20 @@ query($url: URI!, $commentsCount: Int = 50, $reviewsCount: Int = 30) {
       url
       headRefName baseRefName
       headRepository { url }
-      # 普通评论
+      # 普通评论（Issue评论）
       comments(last: $commentsCount) {
         nodes {
           id author { login } body createdAt
-          ... on PullRequestReviewComment {
-            path diffHunk
+        }
+      }
+      # 审核评论（行内代码评论）- 单独查询
+      reviewThreads(last: $reviewsCount) {
+        nodes {
+          comments(last: 10) {
+            nodes {
+              id author { login } body createdAt path diffHunk
+              pullRequestReview { id }
+            }
           }
         }
       }
@@ -243,11 +272,6 @@ query($url: URI!, $commentsCount: Int = 50, $reviewsCount: Int = 30) {
       reviews(last: $reviewsCount) {
         nodes {
           id author { login } body createdAt submittedAt state
-          comments(last: $commentsCount) {
-            nodes {
-              id author { login } body createdAt path diffHunk
-            }
-          }
         }
       }
     }
@@ -264,7 +288,7 @@ query($url: URI!, $commentsCount: Int = 50, $reviewsCount: Int = 30) {
       repository { nameWithOwner }
       url
       comments(last: $commentsCount) {
-        nodes { id author { login } body createdAt path diffHunk }
+        nodes { id author { login } body createdAt path }
       }
     }
     ... on Discussion {
@@ -353,7 +377,7 @@ def find_trigger_node(nodes: List[TimelineItem], trigger_node_id: str = None) ->
     else:
         # 逆序查找最新包含@的节点
         for node in reversed(nodes):
-            if BOT_HANDLE.lower() in node.body.lower():
+            if node.body and BOT_HANDLE.lower() in node.body.lower():
                 return node, nodes
 
     return None, nodes
@@ -497,14 +521,12 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
     timeline_items = []
 
     if resource_data["__typename"] == "PullRequest":
-        # 提取评论和审核
-        comments = resource_data.get("comments", {}).get("nodes", [])
-        reviews = resource_data.get("reviews", {}).get("nodes", [])
-        timeline_items = merge_and_sort_timeline(comments, reviews)
+        # 提取所有时间线项目
+        timeline_items = extract_pr_timeline_items(resource_data)
 
     elif resource_data["__typename"] == "Issue":
         comments = resource_data.get("comments", {}).get("nodes", [])
-        timeline_items = merge_and_sort_timeline(comments, [])
+        timeline_items = merge_comments_to_timeline(comments)
 
     elif resource_data["__typename"] == "Commit":
         comments = resource_data.get("comments", {}).get("nodes", [])
@@ -518,7 +540,7 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
                     user=c.get("author", {}).get("login", "unknown"),
                     type="comment",
                     path=c.get("path"),
-                    diff_hunk=c.get("diffHunk")
+                    diff_hunk=None  # Commit评论没有diffHunk字段
                 ))
 
     elif resource_data["__typename"] == "Discussion":
@@ -543,7 +565,7 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
                             "body": reply.get("body"),
                             "created_at": reply.get("created_at")
                         })
-        timeline_items = merge_and_sort_timeline(all_comments, [])
+        timeline_items = merge_comments_to_timeline(all_comments)
 
     # 3. 寻找触发节点
     trigger_node = None
