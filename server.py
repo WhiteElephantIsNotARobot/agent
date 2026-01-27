@@ -199,14 +199,14 @@ def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
     comments = resource_data.get("comments", {}).get("nodes", [])
     for c in comments:
         if c.get("body"):
-            created_at = c.get("created_at", "")
+            created_at = c.get("createdAt", "")
             if not created_at:
                 created_at = "1970-01-01T00:00:00Z"  # 默认值
             timeline.append(TimelineItem(
                 id=str(c.get("id", "")),
                 body=c.get("body", ""),
                 created_at=created_at,
-                user=c.get("author", {}).get("login", "unknown"),
+                user=(c.get("author") or {}).get("login", "unknown"),
                 type="comment"
             ))
 
@@ -223,7 +223,7 @@ def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
                 id=str(r.get("id", "")),
                 body=r.get("body", ""),
                 created_at=created_at,
-                user=r.get("author", {}).get("login", "unknown"),
+                user=(r.get("author") or {}).get("login", "unknown"),
                 type="review",
                 state=r.get("state")
             ))
@@ -234,14 +234,14 @@ def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
         thread_comments = thread.get("comments", {}).get("nodes", [])
         for rc in thread_comments:
             if rc.get("body"):
-                created_at = rc.get("created_at", "")
+                created_at = rc.get("createdAt", "")
                 if not created_at:
                     created_at = "1970-01-01T00:00:00Z"  # 默认值
                 timeline.append(TimelineItem(
                     id=str(rc.get("id", "")),
                     body=rc.get("body", ""),
                     created_at=created_at,
-                    user=rc.get("author", {}).get("login", "unknown"),
+                    user=(rc.get("author") or {}).get("login", "unknown"),
                     type="review_comment",
                     path=rc.get("path"),
                     diff_hunk=rc.get("diffHunk"),
@@ -273,14 +273,14 @@ def merge_comments_to_timeline(comments: List[Dict]) -> List[TimelineItem]:
     timeline = []
     for c in comments:
         if c.get("body"):
-            created_at = c.get("created_at", "")
+            created_at = c.get("createdAt", "")
             if not created_at:
                 created_at = "1970-01-01T00:00:00Z"
             timeline.append(TimelineItem(
                 id=str(c.get("id", "")),
                 body=c.get("body", ""),
                 created_at=created_at,
-                user=c.get("author", {}).get("login", "unknown"),
+                user=(c.get("author") or {}).get("login", "unknown"),
                 type="comment"
             ))
     timeline.sort(key=lambda x: x.created_at)
@@ -292,7 +292,9 @@ query($url: URI!, $commentsCount: Int = 50, $reviewsCount: Int = 30) {
   resource(url: $url) {
     __typename
     ... on PullRequest {
-      title body number
+      title body number id
+      author { login }
+      createdAt
       baseRepository { nameWithOwner }
       url
       headRefName baseRefName
@@ -322,7 +324,9 @@ query($url: URI!, $commentsCount: Int = 50, $reviewsCount: Int = 30) {
       }
     }
     ... on Issue {
-      title body number
+      title body number id
+      author { login }
+      createdAt
       repository { nameWithOwner }
       url
       comments(last: $commentsCount) {
@@ -347,6 +351,61 @@ async def fetch_resource_details(client: httpx.AsyncClient, raw_url: str) -> Dic
     """
     获取资源的详细信息
     """
+    # 检查是否为Discussion类型（GraphQL的resource(url:)查询不支持Discussion）
+    if "/discussions/" in raw_url:
+        try:
+            # 使用REST API获取discussion详情
+            headers = {"Authorization": f"token {GQL_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+
+            # 1. 获取discussion基本信息
+            discussion_resp = await client.get(raw_url, headers=headers)
+            if discussion_resp.status_code != 200:
+                logger.warning(f"Failed to fetch discussion: {discussion_resp.status_code} - {discussion_resp.text}")
+                return None
+
+            discussion_data = discussion_resp.json()
+
+            # 2. 获取discussion评论
+            comments_url = f"{raw_url}/comments"
+            comments_resp = await client.get(comments_url, headers=headers, params={"per_page": 50})
+            comments = []
+            if comments_resp.status_code == 200:
+                comments = comments_resp.json()
+
+            # 转换为与GraphQL类似的结构，方便后续统一处理
+            # GitHub REST API字段名转换为驼峰命名以保持一致性
+            data = {
+                "__typename": "Discussion",
+                "title": discussion_data.get("title", ""),
+                "body": discussion_data.get("body", ""),
+                "number": discussion_data.get("number", 0),
+                "author": {
+                    "login": (discussion_data.get("user") or {}).get("login", "unknown")
+                },
+                "createdAt": discussion_data.get("created_at", ""),
+                "repository": {
+                    "nameWithOwner": discussion_data.get("repository", {}).get("full_name", "")
+                },
+                "url": discussion_data.get("html_url", "").replace("github.com/", "api.github.com/repos/"),
+                "comments": {
+                    "nodes": [
+                        {
+                            "id": str(c.get("id", "")),
+                            "author": {
+                                "login": (c.get("user") or {}).get("login", "unknown")
+                            },
+                            "body": c.get("body", ""),
+                            "createdAt": c.get("created_at", "")
+                        }
+                        for c in comments
+                    ]
+                }
+            }
+            return data
+        except Exception as e:
+            logger.error(f"Exception during Discussion REST API call: {e}")
+            return None
+
     # 转换为GraphQL格式
     subject_url = raw_url.replace("api.github.com/repos/", "github.com/")
     subject_url = subject_url.replace("/pulls/", "/pull/")
@@ -438,7 +497,8 @@ def build_rich_context(
         repo_full = resource_data.get("repository", {}).get("nameWithOwner", "")
     elif resource_type == "Commit":
         repo_full = resource_data.get("repository", {}).get("nameWithOwner", "")
-    # Discussion 类型当前不支持
+    elif resource_type == "Discussion":
+        repo_full = resource_data.get("repository", {}).get("nameWithOwner", "")
     
     # 如果无法从GraphQL获取repo信息，尝试从URL解析
     if not repo_full and raw_url:
@@ -458,6 +518,10 @@ def build_rich_context(
         # PR不设置issue_body，避免与pr_body重复
         issue_body_value = None
         # 对于PR，title应该为空，使用pr_title
+        title_value = None
+    elif resource_type == "Discussion":
+        # Discussion不设置issue_body和title，使用discussion_title和discussion_body
+        issue_body_value = None
         title_value = None
     else:
         issue_body_value = resource_data.get("body", "")[:3000] if resource_data.get("body") else None
@@ -655,8 +719,8 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
             timeline_items.append(TimelineItem(
                 id=f"issue_body_{resource_data.get('id', '')}",
                 body=issue_body,
-                created_at=resource_data.get("created_at", "1970-01-01T00:00:00Z"),
-                user=resource_data.get("author", {}).get("login", "unknown"),
+                created_at=resource_data.get("createdAt", "1970-01-01T00:00:00Z"),
+                user=(resource_data.get("author") or {}).get("login", "unknown"),
                 type="issue_body"
             ))
             # 按时间排序
@@ -667,21 +731,35 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
         # 将commit评论转换为TimelineItem
         for c in comments:
             if c.get("body"):
-                created_at = c.get("created_at", "")
+                created_at = c.get("createdAt", "")
                 if not created_at:
                     created_at = "1970-01-01T00:00:00Z"
                 timeline_items.append(TimelineItem(
                     id=str(c.get("id", "")),
                     body=c.get("body", ""),
                     created_at=created_at,
-                    user=c.get("author", {}).get("login", "unknown"),
+                    user=(c.get("author") or {}).get("login", "unknown"),
                     type="comment",
                     path=c.get("path"),
                     diff_hunk=None  # Commit评论没有diffHunk字段
                 ))
     
-    # Discussion 类型当前不支持，因为GraphQL查询中移除了Discussion片段
-    # 如果需要支持Discussion，需要专门的REST API处理
+    elif resource_data["__typename"] == "Discussion":
+        comments = resource_data.get("comments", {}).get("nodes", [])
+        timeline_items = merge_comments_to_timeline(comments)
+
+        # 如果discussion body中有@机器人，也添加到时间线中
+        discussion_body = resource_data.get("body", "")
+        if discussion_body and BOT_HANDLE.lower() in discussion_body.lower():
+            timeline_items.append(TimelineItem(
+                id=f"discussion_body_{resource_data.get('id', '')}",
+                body=discussion_body,
+                created_at=resource_data.get("createdAt", "1970-01-01T00:00:00Z"),
+                user=(resource_data.get("author") or {}).get("login", "unknown"),
+                type="discussion_body"
+            ))
+            # 按时间排序
+            timeline_items.sort(key=lambda x: x.created_at)
 
     # 3. 寻找触发节点
     trigger_node = None
@@ -710,11 +788,24 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
             trigger_node = TimelineItem(
                 id=f"issue_body_{resource_data.get('id', '')}",
                 body=issue_body,
-                created_at=resource_data.get("created_at", "1970-01-01T00:00:00Z"),
-                user=resource_data.get("author", {}).get("login", "unknown"),
+                created_at=resource_data.get("createdAt", "1970-01-01T00:00:00Z"),
+                user=(resource_data.get("author") or {}).get("login", "unknown"),
                 type="issue_body"
             )
             logger.info(f"Found trigger node in issue body: {trigger_node.id} by @{trigger_node.user} (type: {trigger_node.type})")
+
+    # 如果还是没有找到触发节点，检查discussion body是否包含@机器人
+    if not trigger_node and resource_data["__typename"] == "Discussion":
+        discussion_body = resource_data.get("body", "")
+        if discussion_body and BOT_HANDLE.lower() in discussion_body.lower():
+            trigger_node = TimelineItem(
+                id=f"discussion_body_{resource_data.get('id', '')}",
+                body=discussion_body,
+                created_at=resource_data.get("createdAt", "1970-01-01T00:00:00Z"),
+                user=(resource_data.get("author") or {}).get("login", "unknown"),
+                type="discussion_body"
+            )
+            logger.info(f"Found trigger node in discussion body: {trigger_node.id} by @{trigger_node.user} (type: {trigger_node.type})")
 
     # 4. 权限检查和触发节点验证
     if not trigger_node:
