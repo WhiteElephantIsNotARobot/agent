@@ -593,8 +593,17 @@ def build_rich_context(
         context.commit_sha = resource_data.get("oid")
         context.title = resource_data.get("message", "")[:200]
 
-    # Discussion 类型当前不支持
-    # 如果需要支持Discussion，需要专门的REST API处理
+    elif resource_type == "Discussion":
+        # 设置Discussion的标题和正文
+        discussion_title = resource_data.get("title")
+        context.discussion_title = discussion_title
+        context.title = discussion_title  # 同时设置通用title字段
+        context.discussion_body = resource_data.get("body", "")[:3000] if resource_data.get("body") else None
+        # 检查是否在Discussion正文中被提及
+        if context.discussion_body:
+            context.is_mention_in_body = BOT_HANDLE.lower() in context.discussion_body.lower()
+
+    # Discussion 类型已通过REST API支持
 
     # 触发者信息
     if trigger_node:
