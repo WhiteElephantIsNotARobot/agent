@@ -36,7 +36,7 @@ WORKDIR /app
 # 从构建阶段复制依赖和代码
 COPY --from=builder --chown=app:app /app /app
 
-# 安装运行时依赖（如果需要）
+# 安装运行时依赖（Alpine 需要 libgcc 等运行时库）
 RUN apk add --no-cache \
     libgcc \
     && rm -rf /var/cache/apk/*
@@ -44,5 +44,5 @@ RUN apk add --no-cache \
 # 切换到非 root 用户
 USER app
 
-# 启动应用
-CMD ["fastapi", "run", "server.py", "--host", "0.0.0.0", "--port", "8000"]
+# 启动应用 (使用 uvicorn 代替 fastapi run，更适合生产环境)
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

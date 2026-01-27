@@ -48,7 +48,7 @@ USER app
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import httpx; httpx.get('http://localhost:8000/health', timeout=2)" || exit 1
+    CMD ["python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=2)"]
 
-# 启动应用
-CMD ["fastapi", "run", "server.py", "--host", "0.0.0.0", "--port", "8000"]
+# 启动应用 (使用 uvicorn 代替 fastapi run，更适合生产环境)
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

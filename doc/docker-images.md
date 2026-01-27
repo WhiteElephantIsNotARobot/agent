@@ -31,10 +31,13 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
+ENV UV_PYTHON=/usr/local/bin/python3.12
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-editable
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable --no-install-project
 COPY . .
-RUN uv sync --frozen --no-dev --no-editable
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-editable
 
 FROM python:3.12-slim-bookworm AS runtime
 RUN groupadd -r app && useradd -r -g app app
@@ -42,7 +45,9 @@ WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 USER app
-CMD ["fastapi", "run", "server.py", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=2)"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 ---
@@ -87,7 +92,9 @@ COPY --from=builder --chown=nonroot:nonroot /python /python
 COPY --from=builder --chown=nonroot:nonroot /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:/python/bin:$PATH"
 USER nonroot
-CMD ["fastapi", "run", "server.py", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=2)"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 ---
@@ -110,6 +117,52 @@ CMD ["fastapi", "run", "server.py", "--host", "0.0.0.0", "--port", "8000"]
 
 **原因**: Alpine 使用 musl libc，与许多 Python 包（尤其是科学计算、机器学习相关）存在兼容性问题，且性能可能不如 glibc。
 
+**使用示例**:
+```dockerfile
+FROM python:3.12-alpine AS builder
+
+# Alpine 需要额外的系统包来构建某些 Python 依赖
+RUN apk add --no-cache \
+    build-base \
+    linux-headers \
+    && rm -rf /var/cache/apk/*
+
+WORKDIR /app
+
+# 安装 pip
+RUN pip install --upgrade pip
+
+# 复制依赖文件
+COPY requirements.txt .
+
+# 安装依赖
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制源代码
+COPY . .
+
+FROM python:3.12-alpine AS runtime
+
+# 创建非 root 用户
+RUN addgroup -S app && adduser -S app -G app
+
+WORKDIR /app
+
+# 从构建阶段复制依赖和代码
+COPY --from=builder --chown=app:app /app /app
+
+# 安装运行时依赖
+RUN apk add --no-cache \
+    libgcc \
+    && rm -rf /var/cache/apk/*
+
+# 切换到非 root 用户
+USER app
+
+# 启动应用
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
 ---
 
 ## 推荐方案
@@ -131,7 +184,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import httpx; httpx.get('http://localhost:8000/health', timeout=2)\" || exit 1"]
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=2)"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -155,7 +208,7 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import httpx; httpx.get('http://localhost:8000/health', timeout=2)\" || exit 1"]
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=2)"]
       interval: 30s
       timeout: 3s
       retries: 3
