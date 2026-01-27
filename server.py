@@ -726,7 +726,7 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
         issue_body = resource_data.get("body", "")
         if issue_body and BOT_HANDLE.lower() in issue_body.lower():
             timeline_items.append(TimelineItem(
-                id=f"issue_body_{resource_data.get('id', '')}",
+                id=f"issue_body_{resource_data.get('number', '')}",
                 body=issue_body,
                 created_at=resource_data.get("createdAt", "1970-01-01T00:00:00Z"),
                 user=(resource_data.get("author") or {}).get("login", "unknown"),
@@ -761,7 +761,7 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
         discussion_body = resource_data.get("body", "")
         if discussion_body and BOT_HANDLE.lower() in discussion_body.lower():
             timeline_items.append(TimelineItem(
-                id=f"discussion_body_{resource_data.get('id', '')}",
+                id=f"discussion_body_{resource_data.get('number', '')}",
                 body=discussion_body,
                 created_at=resource_data.get("createdAt", "1970-01-01T00:00:00Z"),
                 user=(resource_data.get("author") or {}).get("login", "unknown"),
@@ -795,7 +795,7 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
         issue_body = resource_data.get("body", "")
         if issue_body and BOT_HANDLE.lower() in issue_body.lower():
             trigger_node = TimelineItem(
-                id=f"issue_body_{resource_data.get('id', '')}",
+                id=f"issue_body_{resource_data.get('number', '')}",
                 body=issue_body,
                 created_at=resource_data.get("createdAt", "1970-01-01T00:00:00Z"),
                 user=(resource_data.get("author") or {}).get("login", "unknown"),
@@ -808,7 +808,7 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
         discussion_body = resource_data.get("body", "")
         if discussion_body and BOT_HANDLE.lower() in discussion_body.lower():
             trigger_node = TimelineItem(
-                id=f"discussion_body_{resource_data.get('id', '')}",
+                id=f"discussion_body_{resource_data.get('number', '')}",
                 body=discussion_body,
                 created_at=resource_data.get("createdAt", "1970-01-01T00:00:00Z"),
                 user=(resource_data.get("author") or {}).get("login", "unknown"),
