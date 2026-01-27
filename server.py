@@ -93,7 +93,23 @@ class TaskContext(BaseModel):
 
     def to_json_string(self) -> str:
         """Convert context to JSON string for passing to workflow."""
-        return json.dumps(self.model_dump(), ensure_ascii=False)
+        # 清理null字段，只包含有实际值的字段
+        data = self.model_dump()
+        cleaned_data = {}
+        for key, value in data.items():
+            if value is not None:
+                # 对于列表/字典，如果是空的也不包含
+                if isinstance(value, (list, dict)) and not value:
+                    continue
+                # 确保字符串中的换行符被正确保留
+                if isinstance(value, str):
+                    # JSON会正确处理换行符为\n，这里确保没有额外处理
+                    cleaned_data[key] = value
+                else:
+                    cleaned_data[key] = value
+        # 使用ensure_ascii=False保留非ASCII字符
+        # 注意：去掉indent参数以减少JSON大小（GitHub Actions有64KB限制）
+        return json.dumps(cleaned_data, ensure_ascii=False)
 
 # --- 智能节选算法 (恢复早期版本的3:1算法) ---
 def truncate_context_by_chars(items: List[TimelineItem], max_chars: int) -> Tuple[List[TimelineItem], bool]:
@@ -181,10 +197,13 @@ def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
     comments = resource_data.get("comments", {}).get("nodes", [])
     for c in comments:
         if c.get("body"):
+            created_at = c.get("created_at", "")
+            if not created_at:
+                created_at = "1970-01-01T00:00:00Z"  # 默认值
             timeline.append(TimelineItem(
                 id=str(c.get("id", "")),
                 body=c.get("body", ""),
-                created_at=c.get("created_at", ""),
+                created_at=created_at,
                 user=c.get("author", {}).get("login", "unknown"),
                 type="comment"
             ))
@@ -193,10 +212,14 @@ def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
     reviews = resource_data.get("reviews", {}).get("nodes", [])
     for r in reviews:
         if r.get("body"):
+            # 优先使用submitted_at，如果没有则使用created_at
+            created_at = r.get("submitted_at", r.get("created_at", ""))
+            if not created_at:
+                created_at = "1970-01-01T00:00:00Z"  # 默认值
             timeline.append(TimelineItem(
                 id=str(r.get("id", "")),
                 body=r.get("body", ""),
-                created_at=r.get("submitted_at", r.get("created_at", "")),
+                created_at=created_at,
                 user=r.get("author", {}).get("login", "unknown"),
                 type="review",
                 state=r.get("state")
@@ -208,10 +231,13 @@ def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
         thread_comments = thread.get("comments", {}).get("nodes", [])
         for rc in thread_comments:
             if rc.get("body"):
+                created_at = rc.get("created_at", "")
+                if not created_at:
+                    created_at = "1970-01-01T00:00:00Z"  # 默认值
                 timeline.append(TimelineItem(
                     id=str(rc.get("id", "")),
                     body=rc.get("body", ""),
-                    created_at=rc.get("created_at", ""),
+                    created_at=created_at,
                     user=rc.get("author", {}).get("login", "unknown"),
                     type="review_comment",
                     path=rc.get("path"),
@@ -221,6 +247,20 @@ def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
 
     # 按时间排序
     timeline.sort(key=lambda x: x.created_at)
+    
+    # 调试信息
+    if timeline:
+        logger.info(f"Timeline items extracted: {len(timeline)} total")
+        # 显示不同类型数量
+        comment_count = sum(1 for item in timeline if item.type == "comment")
+        review_count = sum(1 for item in timeline if item.type == "review")
+        review_comment_count = sum(1 for item in timeline if item.type == "review_comment")
+        logger.info(f"  Comments: {comment_count}, Reviews: {review_count}, Review Comments: {review_comment_count}")
+        
+        # 显示最后3个项目
+        for i, item in enumerate(timeline[-3:]):
+            logger.info(f"  [{len(timeline)-3+i}] {item.created_at[:19]} @{item.user} ({item.type}): {item.body[:50]}...")
+    
     return timeline
 
 def merge_comments_to_timeline(comments: List[Dict]) -> List[TimelineItem]:
@@ -367,6 +407,7 @@ def find_trigger_node(nodes: List[TimelineItem], trigger_node_id: str = None) ->
         # 逆序查找最新包含@的节点
         for node in reversed(nodes):
             if node.body and BOT_HANDLE.lower() in node.body.lower():
+                logger.info(f"Found trigger node: {node.id} by @{node.user} (type: {node.type})")
                 return node, nodes
 
     return None, nodes
@@ -391,14 +432,12 @@ def build_rich_context(
         repo_full = resource_data.get("repository", {}).get("nameWithOwner", "")
     elif resource_type == "Commit":
         repo_full = resource_data.get("repository", {}).get("nameWithOwner", "")
-    elif resource_type == "Discussion":
-        repo_full = resource_data.get("repository", {}).get("nameWithOwner", "")
+    # Discussion 类型当前不支持
     
     # 如果无法从GraphQL获取repo信息，尝试从URL解析
     if not repo_full and raw_url:
         try:
             # 从URL解析：https://api.github.com/repos/owner/repo/issues/123
-            import re
             match = re.search(r'repos/([^/]+/[^/]+)', raw_url)
             if match:
                 repo_full = match.group(1)
@@ -406,14 +445,23 @@ def build_rich_context(
             pass
 
     # 基础信息
+    # 对于PR，issue_body应该为空，使用pr_body
+    issue_body_value = None
+    if resource_type == "PullRequest":
+        # PR不设置issue_body，避免与pr_body重复
+        issue_body_value = None
+    else:
+        issue_body_value = resource_data.get("body", "")[:3000] if resource_data.get("body") else None
+    
     context = TaskContext(
         repo=repo_full,
         event_type=resource_type.lower(),
         event_id=note_id,
         issue_number=resource_data.get("number"),
         title=resource_data.get("title"),
-        issue_body=resource_data.get("body", "")[:3000] if resource_data.get("body") else None,
-        clone_url=f"https://github.com/{repo_full}.git"
+        issue_body=issue_body_value,
+        # 使用SSH格式的克隆URL：git@github.com:owner/repo.git
+        clone_url=f"git@github.com:{repo_full}.git" if repo_full else None
     )
 
     # 特定类型的信息
@@ -423,6 +471,21 @@ def build_rich_context(
         context.head_ref = resource_data.get("headRefName")
         context.base_ref = resource_data.get("baseRefName")
         context.diff_url = raw_url.replace("/issues/", "/pulls/") + ".diff"
+        
+        # 获取PR分支仓库信息
+        head_repo = resource_data.get("headRepository", {})
+        if head_repo and head_repo.get("url"):
+            # 从API URL转换为clone URL（SSH格式）
+            api_url = head_repo.get("url")
+            # https://api.github.com/repos/owner/repo -> git@github.com:owner/repo.git
+            if "api.github.com/repos/" in api_url:
+                # 提取owner/repo部分
+                repo_match = re.search(r'repos/([^/]+/[^/]+)', api_url)
+                if repo_match:
+                    repo_path = repo_match.group(1)
+                    clone_url = f"git@github.com:{repo_path}.git"
+                    context.clone_url = clone_url
+                    logger.info(f"PR branch clone_url (SSH): {clone_url}")
 
         # 检查是否在PR正文中被提及
         if context.pr_body:
@@ -437,9 +500,8 @@ def build_rich_context(
         context.commit_sha = resource_data.get("oid")
         context.title = resource_data.get("message", "")[:200]
 
-    elif resource_type == "Discussion":
-        context.discussion_title = resource_data.get("title")
-        context.discussion_body = resource_data.get("body", "")[:3000] if resource_data.get("body") else None
+    # Discussion 类型当前不支持
+    # 如果需要支持Discussion，需要专门的REST API处理
 
     # 触发者信息
     if trigger_node:
@@ -449,12 +511,18 @@ def build_rich_context(
 
         if trigger_node.type == "review":
             context.is_mention_in_review = True
+        
+        # 记录触发消息（用于调试）
+        logger.info(f"Trigger message: '{trigger_node.body[:100]}{'...' if len(trigger_node.body) > 100 else ''}'")
+        logger.info(f"Trigger node type: {trigger_node.type}")
 
     # 分离评论历史
     if timeline_items:
+        logger.info(f"Applying smart truncation to {len(timeline_items)} timeline items (max: {CONTEXT_MAX_CHARS} chars)")
         # 智能截断
         truncated_items, is_truncated = truncate_context_by_chars(timeline_items, CONTEXT_MAX_CHARS)
         context.is_truncated = is_truncated
+        logger.info(f"Truncation result: {len(truncated_items)} items selected (truncated: {is_truncated})")
 
         # 转换为历史记录格式
         comments_history = []
@@ -462,32 +530,64 @@ def build_rich_context(
         review_comments_batch = []
 
         for item in truncated_items:
-            if item.type in ["comment", "review_comment"]:
-                comments_history.append({
-                    "id": item.id,
-                    "user": item.user,
-                    "body": item.body,
-                    "created_at": item.created_at,
-                    "type": item.type
-                })
-            elif item.type == "review":
-                reviews_history.append({
-                    "id": item.id,
-                    "user": item.user,
-                    "body": item.body,
-                    "state": item.state,
-                    "submitted_at": item.created_at
-                })
+            # 根据触发类型决定包含哪些历史
+            trigger_type = trigger_node.type if trigger_node else None
+            
+            # 如果是review或review_comment触发，只保留review相关内容
+            if trigger_type in ["review", "review_comment"]:
+                if item.type == "review":
+                    reviews_history.append({
+                        "id": item.id,
+                        "user": item.user,
+                        "body": item.body,
+                        "state": item.state,
+                        "submitted_at": item.created_at
+                    })
+                elif item.type == "review_comment" and item.review_id:
+                    # 只保留与当前review相关的评论
+                    # 如果trigger_node是review本身，其id就是review_id
+                    # 如果trigger_node是review_comment，其review_id字段就是所属review
+                    trigger_review_id = trigger_node.review_id if trigger_node.review_id else trigger_node.id
+                    if item.review_id == trigger_review_id:
+                        review_comments_batch.append({
+                            "id": item.id,
+                            "user": item.user,
+                            "body": item.body,
+                            "path": item.path,
+                            "diff_hunk": item.diff_hunk
+                        })
+                        logger.info(f"Including review comment {item.id} for review {trigger_review_id}")
+                # 对于review触发，不保留普通comment
+            else:
+                # 普通触发：包含所有类型
+                if item.type in ["comment", "review_comment"]:
+                    # review_comment不应该混入comments_history
+                    if item.type == "comment":
+                        comments_history.append({
+                            "id": item.id,
+                            "user": item.user,
+                            "body": item.body,
+                            "created_at": item.created_at,
+                            "type": item.type
+                        })
+                elif item.type == "review":
+                    reviews_history.append({
+                        "id": item.id,
+                        "user": item.user,
+                        "body": item.body,
+                        "state": item.state,
+                        "submitted_at": item.created_at
+                    })
 
-            # 如果是审核评论，添加到批次
-            if item.type == "review_comment" and item.review_id:
-                review_comments_batch.append({
-                    "id": item.id,
-                    "user": item.user,
-                    "body": item.body,
-                    "path": item.path,
-                    "diff_hunk": item.diff_hunk
-                })
+                # 如果是审核评论，添加到批次（如果是review触发会更严格）
+                if item.type == "review_comment" and item.review_id:
+                    review_comments_batch.append({
+                        "id": item.id,
+                        "user": item.user,
+                        "body": item.body,
+                        "path": item.path,
+                        "diff_hunk": item.diff_hunk
+                    })
 
         if comments_history:
             context.comments_history = comments_history
@@ -519,10 +619,11 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
 
     # 2. 构建时间线
     timeline_items = []
-
+    
     if resource_data["__typename"] == "PullRequest":
         # 提取所有时间线项目
         timeline_items = extract_pr_timeline_items(resource_data)
+        logger.info(f"Extracted {len(timeline_items)} timeline items for PR #{resource_data.get('number')}")
 
     elif resource_data["__typename"] == "Issue":
         comments = resource_data.get("comments", {}).get("nodes", [])
@@ -533,39 +634,21 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
         # 将commit评论转换为TimelineItem
         for c in comments:
             if c.get("body"):
+                created_at = c.get("created_at", "")
+                if not created_at:
+                    created_at = "1970-01-01T00:00:00Z"
                 timeline_items.append(TimelineItem(
                     id=str(c.get("id", "")),
                     body=c.get("body", ""),
-                    created_at=c.get("created_at", ""),
+                    created_at=created_at,
                     user=c.get("author", {}).get("login", "unknown"),
                     type="comment",
                     path=c.get("path"),
                     diff_hunk=None  # Commit评论没有diffHunk字段
                 ))
-
-    elif resource_data["__typename"] == "Discussion":
-        comments = resource_data.get("comments", {}).get("nodes", [])
-        # 展开Discussion的回复
-        all_comments = []
-        for c in comments:
-            if c.get("body"):
-                all_comments.append({
-                    "id": c.get("id"),
-                    "author": c.get("author", {}),
-                    "body": c.get("body"),
-                    "created_at": c.get("created_at")
-                })
-            # 添加回复
-            if c.get("replies") and c["replies"].get("nodes"):
-                for reply in c["replies"]["nodes"]:
-                    if reply.get("body"):
-                        all_comments.append({
-                            "id": reply.get("id"),
-                            "author": reply.get("author", {}),
-                            "body": reply.get("body"),
-                            "created_at": reply.get("created_at")
-                        })
-        timeline_items = merge_comments_to_timeline(all_comments)
+    
+    # Discussion 类型当前不支持，因为GraphQL查询中移除了Discussion片段
+    # 如果需要支持Discussion，需要专门的REST API处理
 
     # 3. 寻找触发节点
     trigger_node = None
@@ -615,9 +698,20 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
     # 5. 构建完整上下文
     context = build_rich_context(resource_data, timeline_items, trigger_node, raw_url, thread_id)
 
-    # 6. 获取diff内容（对于PR）
+    # 6. 获取diff内容（根据触发类型决定）
     if resource_data["__typename"] in ["PullRequest", "Commit"]:
-        context.diff_content = await fetch_diff_content(client, raw_url)
+        # 如果是review或review_comment触发，不获取完整PR diff（使用review comments的diff_hunk）
+        if trigger_node and trigger_node.type in ["review", "review_comment"]:
+            logger.info("Review/review_comment trigger detected, skipping full PR diff")
+            # review触发时不提供完整diff，review_comments_batch中已经有具体diff_hunk
+        else:
+            # 普通触发：获取完整diff
+            diff_content = await fetch_diff_content(client, raw_url)
+            if diff_content:
+                context.diff_content = diff_content
+                logger.info(f"Full diff fetched: {len(diff_content)} chars")
+            else:
+                logger.info("No diff content available")
 
     # 7. 检查是否已处理
     if trigger_node.id in processed_cache:
@@ -640,30 +734,56 @@ async def handle_notification(client: httpx.AsyncClient, note: Dict):
 
 def generate_task_description(event_type: str, context: TaskContext, trigger_node: TimelineItem) -> str:
     """
-    根据事件类型生成自然语言任务描述
+    生成LLM任务描述：始终保留原始触发消息（包括@机器人）
+    策略：
+    1. 如果触发消息包含实际内容（不只是@机器人），直接使用原始消息
+    2. 如果只是@机器人（空提及），生成智能默认描述
     """
-    base_desc = ""
-
-    if event_type == "PullRequest":
-        title_suffix = f" - {context.pr_title}" if context.pr_title else ""
-        base_desc = f"Review PR #{context.issue_number}{title_suffix} in {context.repo}"
-
-    elif event_type == "Issue":
-        title_suffix = f" - {context.title}" if context.title else ""
-        base_desc = f"Analyze issue #{context.issue_number}{title_suffix} in {context.repo}"
-
-    elif event_type == "Commit":
-        base_desc = f"Review commit {context.commit_sha[:8]} in {context.repo}"
-
-    elif event_type == "Discussion":
-        base_desc = f"Participate in discussion '{context.discussion_title}' in {context.repo}"
-
-    # 添加触发信息
-    if trigger_node:
-        user_info = f" (triggered by @{trigger_node.user})"
-        base_desc += user_info
-
-    return base_desc
+    trigger_message = trigger_node.body
+    
+    # 检查是否是"空提及"（只有@机器人或只有标点）
+    is_empty_mention = False
+    if trigger_message:
+        # 移除机器人提及和空白字符，检查剩余内容
+        pattern = re.compile(re.escape(BOT_HANDLE), re.IGNORECASE)
+        cleaned = pattern.sub("", trigger_message).strip()
+        
+        # 如果清理后完全为空，视为空提及
+        if not cleaned:
+            is_empty_mention = True
+        else:
+            # 检查是否只包含标点符号或极短的无效内容
+            # 常见标点符号（中英文）
+            punctuation_pattern = r'^[\s\.,!?。，！？;:;：\-—~～、]*$'
+            if re.match(punctuation_pattern, cleaned):
+                is_empty_mention = True
+            # 检查是否只有非常短且无意义的词（如"OK"、"好的"等）
+            elif len(cleaned) <= 4:
+                # 如果是非常短的常见响应词，不视为空提及
+                short_valid_responses = ["ok", "好的", "行", "yes", "no", "好", "okay", "收到", "roger", "copy"]
+                if cleaned.lower() not in short_valid_responses and cleaned not in short_valid_responses:
+                    # 检查是否全是字母或数字（可能是有意义的简短回答）
+                    if not re.match(r'^[a-zA-Z0-9]+$', cleaned):
+                        is_empty_mention = True
+    
+    # 情况1：空提及或没有实际内容 -> 生成智能默认描述
+    if is_empty_mention or not trigger_message:
+        if event_type == "PullRequest":
+            # 对于PR，查看是否有代码变更需要审查
+            if context.diff_content and len(context.diff_content) > 100:
+                return f"Please review the code changes in PR #{context.issue_number}: {context.pr_title or 'No title'}"
+            else:
+                return f"Please review PR #{context.issue_number}: {context.pr_title or 'No title'}"
+        elif event_type == "Issue":
+            return f"Please analyze issue #{context.issue_number}: {context.title or 'No title'}"
+        elif event_type == "Commit":
+            return f"Please review commit {context.commit_sha[:8] if context.commit_sha else 'unknown'}: {context.title or 'No message'}"
+        else:
+            return f"Please process this {event_type}"
+    
+    # 情况2：有实际内容的触发消息 -> 直接返回原始消息（包含@机器人）
+    # 重要：保留原始@指令，让LLM知道这是直接针对它的请求
+    return trigger_message
 
 async def trigger_workflow(client: httpx.AsyncClient, ctx: TaskContext, task_text: str, node_id: str, thread_id: str) -> bool:
     """
@@ -671,11 +791,36 @@ async def trigger_workflow(client: httpx.AsyncClient, ctx: TaskContext, task_tex
     """
     # 检查上下文大小
     context_str = ctx.to_json_string()
+    logger.info(f"Context size: {len(context_str)} chars")
+    
+    # 调试信息
+    if ctx.comments_history:
+        logger.info(f"Comments history: {len(ctx.comments_history)} items")
+    if ctx.reviews_history:
+        logger.info(f"Reviews history: {len(ctx.reviews_history)} items")
+        for i, review in enumerate(ctx.reviews_history):
+            logger.info(f"  Review[{i}]: @{review.get('user')} - {review.get('body', '')[:50]}...")
+    if ctx.review_comments_batch:
+        logger.info(f"Review comments batch: {len(ctx.review_comments_batch)} items")
+        for i, comment in enumerate(ctx.review_comments_batch):
+            logger.info(f"  ReviewComment[{i}]: @{comment.get('user')} - {comment.get('path')}: {comment.get('body', '')[:50]}...")
+    if ctx.is_truncated is not None:
+        logger.info(f"Context was truncated: {ctx.is_truncated}")
+    
+    # 检查是否有重复/空字段
+    logger.info(f"diff_content present: {bool(ctx.diff_content)}")
+    logger.info(f"clone_url: {ctx.clone_url}")
+    logger.info(f"head_ref: {ctx.head_ref}, base_ref: {ctx.base_ref}")
+    
+    # 记录任务描述
+    logger.info(f"LLM_TASK to send: '{task_text[:200]}{'...' if len(task_text) > 200 else ''}'")
+    
     if len(context_str) > 60000:  # GitHub限制
         logger.warning(f"Context too large ({len(context_str)} chars), truncating...")
         # 简化上下文
         ctx.diff_content = "[Diff truncated due to size limits]"
         if ctx.comments_history and len(ctx.comments_history) > 10:
+            logger.info(f"Reducing comments history from {len(ctx.comments_history)} to 10 items")
             ctx.comments_history = ctx.comments_history[-10:]  # 只保留最近10条
         context_str = ctx.to_json_string()
 
