@@ -10,7 +10,8 @@ jobs:
   update-system-prompt:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      actions: write
+      contents: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
