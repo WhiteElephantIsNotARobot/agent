@@ -30,21 +30,23 @@ jobs:
 
           ISSUE_TITLE="[工作流] Run ${{ github.run_id }}"
 
-          # --- Task：直接原样输出，不用代码块 ---
-          printf "%s" "${{ inputs.task }}" > task.txt
+          # --- Task：直接写入，不用代码块 ---
+          cat > task.txt <<'EOF'
+${{ inputs.task }}
+EOF
 
-          # --- Context：写入原文 ---
-          printf "%s" "${{ inputs.context }}" > raw_context.txt
+          # --- Context：安全写入，不会被拆行 ---
+          cat > raw_context.txt <<'EOF'
+${{ inputs.context }}
+EOF
 
-          # --- 去掉最外层引号（如果有） ---
-          # 例如："{"a":1}" → {"a":1}
+          # --- 去掉最外层引号 ---
           sed 's/^"//; s/"$//' raw_context.txt > context_stripped.txt
 
-          # --- 用 jq 格式化（如果不是 JSON 会直接失败） ---
-          # 你要求“只去掉引号再格式化”，所以这里不做 fallback
+          # --- 格式化 JSON（你要求只做这一步） ---
           jq '.' context_stripped.txt > context.json
 
-          # --- 生成 Markdown（Task 不用代码块，Context 用 JSON 代码块） ---
+          # --- 生成 Markdown ---
           {
             echo "## Task"
             cat task.txt
