@@ -108,34 +108,50 @@ agent/
 
 ### 4. 上下文数据模型 (`TaskContext`)
 
-包含丰富的任务上下文信息：
+包含丰富的任务上下文信息（基于 `pydantic.BaseModel`）：
 
 ```python
+from pydantic import BaseModel
+from typing import Optional, List, Dict
+
 class TaskContext(BaseModel):
     # 基础信息
-    repo: str                    # 仓库名 (owner/repo)
-    event_type: str              # 事件类型 (pr/issue/discussion)
-    event_id: str                # 通知 ID
+    repo: str                                   # 仓库名 (owner/repo)
+    event_type: str                             # 事件类型 (pr/issue/discussion)
+    event_id: str                               # 通知 ID
+    trigger_user: Optional[str] = None          # 触发工作流的用户名
+    issue_number: Optional[int] = None          # Issue/PR 编号
 
-    # 内容
-    pr_title: str                # PR 标题
-    pr_body: str                 # PR 正文
-    issue_body: str              # Issue 正文
-    discussion_title: str        # Discussion 标题
-    discussion_body: str         # Discussion 正文
+    # 标题和正文
+    title: Optional[str] = None                 # Issue/Discussion 标题
+    issue_body: Optional[str] = None            # Issue 正文
+    pr_title: Optional[str] = None              # PR 标题
+    pr_body: Optional[str] = None               # PR 正文
+    discussion_title: Optional[str] = None      # Discussion 标题
+    discussion_body: Optional[str] = None       # Discussion 正文
 
-    # 历史记录
-    comments_history: List[Dict]     # 普通评论
-    reviews_history: List[Dict]      # 审核记录
-    review_comments_batch: List[Dict] # 行内代码评论
+    # 历史数据
+    comments_history: Optional[List[Dict]] = None      # 普通评论历史
+    reviews_history: Optional[List[Dict]] = None       # 审核记录历史
+    review_comments_batch: Optional[List[Dict]] = None # 行内代码评论
 
     # 代码上下文
-    diff_content: str           # PR diff
-    clone_url: str              # SSH 克隆地址
-    head_ref: str               # head 分支
-    base_ref: str               # base 分支
-    head_repo: str              # head repo:branch 格式
-    base_repo: str              # base repo:branch 格式
+    diff_content: Optional[str] = None          # PR diff 内容
+    diff_url: Optional[str] = None              # PR diff 的 URL
+    clone_url: Optional[str] = None             # SSH 克隆地址
+    head_ref: Optional[str] = None              # head 分支
+    base_ref: Optional[str] = None              # base 分支
+    head_repo: Optional[str] = None             # head repo:branch 格式
+    base_repo: Optional[str] = None             # base repo:branch 格式
+    commit_sha: Optional[str] = None            # Commit SHA
+
+    # 元数据
+    current_comment_id: Optional[str] = None    # 触发评论的 ID
+    current_review_id: Optional[str] = None     # 触发审核的 ID
+    is_mention_in_body: Optional[bool] = None   # 是否在正文中被提及
+    is_mention_in_review: Optional[bool] = None # 是否在审核中被提及
+    is_truncated: Optional[bool] = None         # 上下文是否被截断
+    latest_comment_url: Optional[str] = None    # 最新评论的 URL
 ```
 
 ## 环境变量配置
@@ -153,7 +169,7 @@ class TaskContext(BaseModel):
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `ALLOWED_USERS` | - | 允许触发的用户列表 (逗号分隔) |
+| `ALLOWED_USERS` | 无限制 | 允许触发的用户列表 (逗号分隔) |
 | `PROCESSED_LOG` | `/data/processed_notifications.log` | 已处理通知日志路径 |
 | `CONTEXT_MAX_CHARS` | 15000 | 上下文最大字符数 |
 | `DIFF_MAX_CHARS` | 4000 | Diff 内容最大字符数 |
@@ -168,8 +184,9 @@ class TaskContext(BaseModel):
 1. **创建 Issue**：记录任务和上下文
 2. **安装 Claude CLI**：从官方脚本安装
 3. **配置 MCP 服务器**：
-   - DuckDuckGo 搜索 (`ddg-search`)
-   - Context7 文档 (`context7`)
+   - **MCP (Model Context Protocol)**：模型上下文协议，用于扩展 AI 模型的能力
+   - DuckDuckGo 搜索 (`ddg-search`)：提供网络搜索能力
+   - Context7 文档 (`context7`)：提供实时文档查询能力
 4. **预配置 Git**：
    - 用户名/邮箱
    - SSH 认证（可选）
