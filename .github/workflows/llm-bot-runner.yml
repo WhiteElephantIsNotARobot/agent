@@ -13,12 +13,47 @@ on:
         type: string
 
 jobs:
+  create-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    outputs:
+      issue_number: ${{ steps.create-issue.outputs.issue_number }}
+    steps:
+      - name: Create log issue
+        id: create-issue
+        run: |
+          ISSUE_TITLE="[工作流]${{ inputs.task }}"
+          ISSUE_BODY="${{ inputs.context }}"
+
+          echo "创建日志issue..."
+          echo "标题: $ISSUE_TITLE"
+          echo "Body长度: ${#ISSUE_BODY} 字符"
+
+          ISSUE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
+            -d "{\"title\":\"$ISSUE_TITLE\",\"body\":\"$ISSUE_BODY\"}")
+
+          ISSUE_NUMBER=$(echo "$ISSUE_RESPONSE" | grep -o '\"number\":[[:space:]]*[0-9]*' | cut -d':' -f2 | tr -d ' ')
+
+          if [ -n "$ISSUE_NUMBER" ]; then
+            echo "日志issue已创建，编号: $ISSUE_NUMBER"
+            echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          else
+            echo "警告: 无法创建issue，继续执行工作流"
+            echo "Issue创建响应: $ISSUE_RESPONSE"
+          fi
+
   run-llm-bot:
+    needs: create-issue
     runs-on: ubuntu-latest
     env:
       LLM_TASK: ${{ inputs.task }}
       LLM_CONTEXT: ${{ inputs.context }}
-      # GitHub身份令牌（4个名称都设置）
+      LOG_ISSUE_NUMBER: ${{ needs.create-issue.outputs.issue_number }}
+      # GitHub身份令牌（4个名称都设置）- 使用agent的token
       GITHUB_TOKEN: ${{ secrets.WEINAR_API_KEY }}
       GH_TOKEN: ${{ secrets.WEINAR_API_KEY }}
       GITHUBTOKEN: ${{ secrets.WEINAR_API_KEY }}
