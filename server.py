@@ -627,7 +627,7 @@ def build_rich_context(
     # 分离评论历史（基于test_context.py修复review触发过滤逻辑）
     if timeline_items:
         logger.info(f"Applying smart truncation to {len(timeline_items)} timeline items (max: {CONTEXT_MAX_CHARS} chars)")
-        # 智能截断
+        # 智能截断（仅用于评论历史）
         truncated_items, is_truncated = truncate_context_by_chars(timeline_items, CONTEXT_MAX_CHARS)
         context.is_truncated = is_truncated
         logger.info(f"Truncation result: {len(truncated_items)} items selected (truncated: {is_truncated})")
@@ -637,14 +637,16 @@ def build_rich_context(
         reviews_history = []
         review_comments_batch = []
 
-        for item in truncated_items:
-            # 根据触发类型决定包含哪些历史
-            trigger_type = trigger_node.type if trigger_node else None
+        # 获取触发类型
+        trigger_type = trigger_node.type if trigger_node else None
 
-            # 如果是review或review_comment触发，包含所有review和review_comment（按时间线截断）
-            if trigger_type in ["review", "review_comment"]:
-                # 包含所有review（按时间线截断，而不是只包含当前review）
-                if item.type == "review":
+        # review批次使用原始timeline_items确保完整保留（不截断）
+        if trigger_type in ["review", "review_comment"]:
+            # review/review_comment触发：精确过滤，只保留与当前review相关的项目
+            trigger_review_id = trigger_node.review_id if trigger_node.review_id else trigger_node.id
+
+            for item in timeline_items:
+                if item.type == "review" and item.id == trigger_review_id:
                     reviews_history.append({
                         "id": item.id,
                         "user": item.user,
@@ -652,7 +654,8 @@ def build_rich_context(
                         "state": item.state,
                         "submitted_at": item.created_at
                     })
-                elif item.type == "review_comment":
+                    logger.info(f"Including review {item.id} for review {trigger_review_id}")
+                elif item.type == "review_comment" and item.review_id and item.review_id == trigger_review_id:
                     review_comments_batch.append({
                         "id": item.id,
                         "user": item.user,
@@ -660,10 +663,10 @@ def build_rich_context(
                         "path": item.path,
                         "diff_hunk": item.diff_hunk
                     })
-                # 对于review触发，不保留普通comment（基于test_context.py逻辑）
-            else:
-                # 普通触发（comment）：处理comment、review和review_comment
-                # 这样在comment中@时也能包含最新批次的review信息
+                    logger.info(f"Including review comment {item.id} for review {trigger_review_id}")
+        else:
+            # comment触发：使用truncated_items处理评论，使用原始timeline_items处理review批次
+            for item in truncated_items:
                 if item.type == "comment":
                     comments_history.append({
                         "id": item.id,
@@ -672,7 +675,10 @@ def build_rich_context(
                         "created_at": item.created_at,
                         "type": item.type
                     })
-                elif item.type == "review":
+
+            # review批次使用原始timeline_items确保完整保留（不截断）
+            for item in timeline_items:
+                if item.type == "review":
                     reviews_history.append({
                         "id": item.id,
                         "user": item.user,
@@ -680,7 +686,7 @@ def build_rich_context(
                         "state": item.state,
                         "submitted_at": item.created_at
                     })
-                elif item.type == "review_comment":
+                elif item.type == "review_comment" and item.review_id:
                     review_comments_batch.append({
                         "id": item.id,
                         "user": item.user,
