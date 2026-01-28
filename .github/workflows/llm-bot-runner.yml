@@ -13,7 +13,15 @@ on:
         type: string
 
 jobs:
-  - name: Create issue
+  create-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    outputs:
+      issue_number: ${{ steps.create-issue.outputs.issue_number }}
+
+    steps:
+      - name: Create issue
         id: create-issue
         env:
           GH_TOKEN: ${{ github.token }}
