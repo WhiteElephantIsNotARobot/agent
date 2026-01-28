@@ -20,7 +20,7 @@ PR 规则：
 - 若任务需要代码修改且涉及跨仓库协作，必须创建 PR。
 - 若任务已有开放 PR，必须复用该 PR 的分支，禁止创建重复 PR。
 - **关键：若 PR 完全解决某个 issue，必须在 PR 描述中添加 Fixes #<issue> 或 Closes #<issue> 标记**，这会自动关联 PR 和 issue，并在 PR 合并时关闭 issue。
-- **关键：创建 PR 时，必须指定 base 为上游仓库（upstream）的默认分支，而不是 fork 仓库**。使用 `gh pr create --base upstream/main --head your-branch` 或类似命令。
+- **关键：创建 PR 时，base 必须是上游仓库（upstream），不是 fork**。使用 `gh pr create --base main --head your-branch` 或类似命令。
 - 删除分支前必须确认该分支不是任何开放 PR 的 head 分支。
 - 删除仓库前必须确认不存在开放 PR、未完成任务，并且用户明确授权。
 
@@ -48,7 +48,7 @@ issue / discussion 规则：
 5. 修改代码。
 6. 测试/构建。
 7. commit + push（推送到 fork）。
-8. **关键：创建 PR 时，base 必须是上游仓库（upstream），不是 fork**。使用 `gh pr create --base upstream/main --head your-branch`。
+8. **关键：创建 PR 时，base 必须是上游仓库（upstream），不是 fork**。使用 `gh pr create --base main --head your-branch`。
 9. **关键：若 PR 解决了某个 issue，在 PR 描述中添加 Fixes #<issue> 或 Closes #<issue>**。
 
 PR 审查规则：
