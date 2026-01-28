@@ -19,31 +19,62 @@ jobs:
       issues: write
     outputs:
       issue_number: ${{ steps.create-issue.outputs.issue_number }}
+
     steps:
       - name: Create log issue
         id: create-issue
         run: |
-          ISSUE_TITLE="[工作流]${{ inputs.task }}"
-          ISSUE_BODY="${{ inputs.context }}"
+          set -e
 
-          echo "创建日志issue..."
+          ISSUE_TITLE="[工作流] Run ${{ github.run_id }}"
+
+          # 写入 task
+          printf "%s" "${{ inputs.task }}" > task.txt
+
+          # 写入 context
+          printf "%s" "${{ inputs.context }}" > raw_context.txt
+
+          # 尝试格式化 context，如果不是 JSON 就作为字符串处理
+          if jq empty raw_context.txt 2>/dev/null; then
+            jq '.' raw_context.txt > context.json
+          else
+            jq -Rn --arg v "$(cat raw_context.txt)" '$v' > context.json
+          fi
+
+          # 生成最终 body
+          {
+            echo "## Task"
+            echo '```text'
+            cat task.txt
+            echo '```'
+            echo
+            echo "## Context"
+            echo '```json'
+            cat context.json
+            echo '```'
+          } > body.md
+
+          echo "创建日志 issue..."
           echo "标题: $ISSUE_TITLE"
-          echo "Body长度: ${#ISSUE_BODY} 字符"
 
           ISSUE_RESPONSE=$(curl -s -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues" \
-            -d "{\"title\":\"$ISSUE_TITLE\",\"body\":\"$ISSUE_BODY\"}")
+            -d @<(jq -n \
+              --arg title "$ISSUE_TITLE" \
+              --arg body "$(cat body.md)" \
+              '{title:$title, body:$body}')
+          )
 
-          ISSUE_NUMBER=$(echo "$ISSUE_RESPONSE" | grep -o '\"number\":[[:space:]]*[0-9]*' | cut -d':' -f2 | tr -d ' ')
+          ISSUE_NUMBER=$(echo "$ISSUE_RESPONSE" | jq -r '.number')
 
-          if [ -n "$ISSUE_NUMBER" ]; then
-            echo "日志issue已创建，编号: $ISSUE_NUMBER"
+          if [ -n "$ISSUE_NUMBER" ] && [ "$ISSUE_NUMBER" != "null" ]; then
+            echo "日志 issue 已创建，编号: $ISSUE_NUMBER"
             echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
           else
-            echo "警告: 无法创建issue，继续执行工作流"
-            echo "Issue创建响应: $ISSUE_RESPONSE"
+            echo "警告: 无法创建 issue，继续执行工作流"
+            echo "Issue 创建响应: $ISSUE_RESPONSE"
           fi
 
   run-llm-bot:
