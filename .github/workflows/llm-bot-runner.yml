@@ -13,38 +13,33 @@ on:
         type: string
 
 jobs:
-  create-issue:
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    outputs:
-      issue_number: ${{ steps.create-issue.outputs.issue_number }}
-
-    steps:
-      - name: Create log issue
+  - name: Create issue
         id: create-issue
         env:
           GH_TOKEN: ${{ github.token }}
           TASK_CONTENT: ${{ inputs.task }}
           CONTEXT_RAW: ${{ inputs.context }}
         run: |
-          # 1. 格式化 Context (去除外层引号并格式化 JSON)
-          # 如果 CONTEXT_RAW 本身就是 JSON 字符串，jq 可以直接解析
+          # 1. 格式化 Context (通过 env 引用避免引号注入问题)
+          # jq '.' 处理 JSON 格式化，sed 用于二次清理
           FORMATTED_CONTEXT=$(echo "$CONTEXT_RAW" | sed 's/^"//; s/"$//' | jq '.')
 
           # 2. 构建 Markdown 正文
-          # 使用 printf 避免 echo 的转义问题
           printf "## Task\n%s\n\n## Context\n\`\`\`json\n%s\n\`\`\`" \
             "$TASK_CONTENT" "$FORMATTED_CONTEXT" > body.md
 
-          # 3. 使用 GitHub CLI 创建 Issue
+          # 3. 使用 GitHub CLI 创建 Issue (增加 --repo 参数)
+          # $GITHUB_REPOSITORY 环境变量是内置的，格式为 "owner/repo"
           ISSUE_URL=$(gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
             --title "[工作流] Run ${{ github.run_id }}" \
             --body-file body.md)
 
-          # 4. 提取 Issue 编号 (从 URL 结尾提取)
+          # 4. 提取 Issue 编号
           ISSUE_NUMBER=${ISSUE_URL##*/}
           echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          
+          echo "成功创建 Issue: $ISSUE_NUMBER"
 
   run-llm-bot:
     needs: create-issue
