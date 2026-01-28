@@ -28,25 +28,24 @@ jobs:
           TASK_CONTENT: ${{ inputs.task }}
           CONTEXT_RAW: ${{ inputs.context }}
         run: |
-          # 1. 格式化 Context (通过 env 引用避免引号注入问题)
-          # jq '.' 处理 JSON 格式化，sed 用于二次清理
+          # 1. 格式化 Context
           FORMATTED_CONTEXT=$(echo "$CONTEXT_RAW" | sed 's/^"//; s/"$//' | jq '.')
 
           # 2. 构建 Markdown 正文
           printf "## Task\n%s\n\n## Context\n\`\`\`json\n%s\n\`\`\`" \
             "$TASK_CONTENT" "$FORMATTED_CONTEXT" > body.md
 
-          # 3. 使用 GitHub CLI 创建 Issue (增加 --repo 参数)
-          # $GITHUB_REPOSITORY 环境变量是内置的，格式为 "owner/repo"
+          # 3. 创建 Issue（硬编码标签 workflow）
           ISSUE_URL=$(gh issue create \
             --repo "$GITHUB_REPOSITORY" \
             --title "[工作流] Run ${{ github.run_id }}" \
-            --body-file body.md)
+            --body-file body.md \
+            --label "workflow")
 
           # 4. 提取 Issue 编号
           ISSUE_NUMBER=${ISSUE_URL##*/}
           echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
-          
+
           echo "成功创建 Issue: $ISSUE_NUMBER"
 
   run-llm-bot:
