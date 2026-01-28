@@ -1008,6 +1008,9 @@ async def poll_loop():
     async with httpx.AsyncClient(timeout=30.0) as client:
         logger.info("Enhanced polling loop started...")
 
+        # 默认轮询间隔（秒），GitHub将通过X-Poll-Interval头部动态调整
+        poll_interval = 60
+
         while True:
             try:
                 # 获取未读通知
@@ -1018,6 +1021,16 @@ async def poll_loop():
                 )
 
                 if r.status_code == 200:
+                    # 解析并更新轮询间隔（遵守GitHub的X-Poll-Interval要求）
+                    if "X-Poll-Interval" in r.headers:
+                        try:
+                            new_interval = int(r.headers["X-Poll-Interval"])
+                            if new_interval != poll_interval:
+                                logger.info(f"Updating poll interval: {poll_interval} -> {new_interval}s")
+                                poll_interval = new_interval
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Invalid X-Poll-Interval header: {r.headers['X-Poll-Interval']}: {e}")
+
                     notes = r.json()
                     if notes:
                         logger.info(f"Fetched {len(notes)} unread notifications.")
@@ -1028,6 +1041,15 @@ async def poll_loop():
 
                 elif r.status_code == 304:
                     logger.debug("No changes in notifications (304).")
+                    # 即使返回304，GitHub可能仍然包含X-Poll-Interval头部
+                    if "X-Poll-Interval" in r.headers:
+                        try:
+                            new_interval = int(r.headers["X-Poll-Interval"])
+                            if new_interval != poll_interval:
+                                logger.info(f"Updating poll interval (304): {poll_interval} -> {new_interval}s")
+                                poll_interval = new_interval
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Invalid X-Poll-Interval header (304): {r.headers['X-Poll-Interval']}: {e}")
 
                 elif r.status_code == 403:
                     logger.warning("Rate limit hit or forbidden. Sleeping for 120s...")
@@ -1046,8 +1068,8 @@ async def poll_loop():
                 await asyncio.sleep(10)
                 continue
 
-            # 正常轮询间隔
-            await asyncio.sleep(30)
+            # 遵守GitHub指定的轮询间隔
+            await asyncio.sleep(poll_interval)
 
 @app.on_event("startup")
 async def startup():
