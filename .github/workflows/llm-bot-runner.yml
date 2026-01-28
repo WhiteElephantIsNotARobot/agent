@@ -31,12 +31,12 @@ jobs:
           ISSUE_TITLE="[工作流] Run ${{ github.run_id }}"
 
           # --- Task：直接写入，不用代码块 ---
-          cat > task.txt <<'EOF'
+          cat > task.txt <<EOF
 ${{ inputs.task }}
 EOF
 
           # --- Context：安全写入，不会被拆行 ---
-          cat > raw_context.txt <<'EOF'
+          cat > raw_context.txt <<EOF
 ${{ inputs.context }}
 EOF
 
