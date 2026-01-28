@@ -683,13 +683,18 @@ def build_rich_context(
                 if item.type == "review":
                     # 找到最新一次 review（按时间顺序，最后一个是最新）
                     latest_review_id = item.id
-                    reviews_history.append({
-                        "id": item.id,
-                        "user": item.user,
-                        "body": item.body,
-                        "state": item.state,
-                        "submitted_at": item.created_at
-                    })
+
+            # 只添加最新一次 review
+            if latest_review_id:
+                for item in timeline_items:
+                    if item.type == "review" and item.id == latest_review_id:
+                        reviews_history.append({
+                            "id": item.id,
+                            "user": item.user,
+                            "body": item.body,
+                            "state": item.state,
+                            "submitted_at": item.created_at
+                        })
 
             # 只保留与最新 review 相关的 review comments
             if latest_review_id:
