@@ -662,7 +662,8 @@ def build_rich_context(
                     })
                 # 对于review触发，不保留普通comment（基于test_context.py逻辑）
             else:
-                # 普通触发（comment）：只处理comment和review，不处理review_comment
+                # 普通触发（comment）：处理comment、review和review_comment
+                # 这样在comment中@时也能包含最新批次的review信息
                 if item.type == "comment":
                     comments_history.append({
                         "id": item.id,
@@ -678,6 +679,14 @@ def build_rich_context(
                         "body": item.body,
                         "state": item.state,
                         "submitted_at": item.created_at
+                    })
+                elif item.type == "review_comment":
+                    review_comments_batch.append({
+                        "id": item.id,
+                        "user": item.user,
+                        "body": item.body,
+                        "path": item.path,
+                        "diff_hunk": item.diff_hunk
                     })
 
         if comments_history:
