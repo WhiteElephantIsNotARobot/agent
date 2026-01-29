@@ -145,10 +145,8 @@ jobs:
           if [ -n "$WAKE_TIME_API_KEY" ]; then
             echo "配置WakaTime API Key..."
             mkdir -p ~
-            cat <<'EOF' > ~/.wakatime.cfg
-[settings]
-api_key = $WAKE_TIME_API_KEY
-EOF
+            printf "[settings]\napi_key = %s\n" "$WAKE_TIME_API_KEY" > ~/.wakatime.cfg
+
             echo "WakaTime配置完成"
           else
             echo "警告: WAKE_TIME_API_KEY未设置，跳过WakaTime配置"
