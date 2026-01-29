@@ -1,4 +1,4 @@
-name: Update System Prompt Variable
+name: Update System Prompt
 
 on:
   push:
@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  update-system-prompt:
+  update:
     runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: read
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.REPOSITORY_VARIABLE_API_KEY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
