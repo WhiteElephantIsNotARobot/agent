@@ -216,9 +216,7 @@ def extract_pr_timeline_items(resource_data: Dict) -> List[TimelineItem]:
         # 即使 review body 为空也要添加到 timeline，因为 latest_comment_url 可能指向 review 本身
         # 例如：review comment 的 latest_comment_url 指向 review，但 @ 提及在 review comment 中
         # 如果 review 不在 timeline 中，就无法通过 ID 匹配找到它，也就无法回退搜索
-        created_at = r.get("submittedAt", r.get("createdAt", ""))
-        if not created_at:
-            created_at = "1970-01-01T00:00:00Z"  # 默认值
+        created_at = r.get("submittedAt") or r.get("createdAt") or "1970-01-01T00:00:00Z"  # 默认值
         timeline.append(TimelineItem(
             id=str(r.get("id", "")),
             body=r.get("body", ""),
