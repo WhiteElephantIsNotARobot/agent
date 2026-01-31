@@ -964,9 +964,8 @@ async def trigger_workflow(client: httpx.AsyncClient, ctx: TaskContext, task_tex
     # GitHub Actions inputs 限制为 64KB (65536 字节)
     GITHUB_INPUTS_MAX_SIZE = 64000
 
-    # 检查是否需要将数据存储到 issue（因为 repository_dispatch 的 payload 也有 64KB 限制）
+    # 检查是否需要将数据存储到 issue
     issue_number = None
-    use_repository_dispatch = True
 
     # 如果数据太大，需要先创建 issue 存储数据
     if len(context_str) > 50000 or len(task_text) > 10000:
@@ -990,42 +989,48 @@ async def trigger_workflow(client: httpx.AsyncClient, ctx: TaskContext, task_tex
             task_text = ""
         else:
             logger.error("Failed to create issue for large data, falling back to truncation")
-            # 回退到截断方案
-            use_repository_dispatch = False
 
-    # 如果仍然超限（未使用 issue 存储），丢弃 diff_content
+    # 如果仍然超限（未使用 issue 存储），按优先级丢弃数据
     if len(context_str) > GITHUB_INPUTS_MAX_SIZE:
         logger.warning(f"Context too large ({len(context_str)} chars), attempting to reduce...")
 
-        # 优先丢弃 diff_content（diff 通常很大）
+        reduction_steps = []
+
+        # 1. 优先丢弃 diff_content（diff 通常很大）
         if ctx.diff_content:
-            logger.info(f"Dropping diff_content to reduce size (was {len(ctx.diff_content)} chars)")
-            ctx.diff_content = None
-            context_str = ctx.to_json_string()
-            logger.info(f"Context size after dropping diff: {len(context_str)} chars")
+            def drop_diff():
+                logger.info(f"Dropping diff_content to reduce size (was {len(ctx.diff_content)} chars)")
+                ctx.diff_content = None
+            reduction_steps.append(drop_diff)
 
-        # 如果仍然超限，进一步截断评论历史
-        if len(context_str) > GITHUB_INPUTS_MAX_SIZE and ctx.comments_history:
-            original_count = len(ctx.comments_history)
-            # 只保留最近 5 条评论
-            ctx.comments_history = ctx.comments_history[-5:]
-            logger.info(f"Reducing comments history from {original_count} to 5 items")
-            context_str = ctx.to_json_string()
-            logger.info(f"Context size after reducing comments: {len(context_str)} chars")
+        # 2. 截断评论历史（只保留最近 5 条）
+        if ctx.comments_history:
+            def reduce_comments():
+                original_count = len(ctx.comments_history)
+                ctx.comments_history = ctx.comments_history[-5:]
+                logger.info(f"Reducing comments history from {original_count} to 5 items")
+            reduction_steps.append(reduce_comments)
 
-        # 如果仍然超限，丢弃 review_comments_batch
-        if len(context_str) > GITHUB_INPUTS_MAX_SIZE and ctx.review_comments_batch:
-            logger.info(f"Dropping review_comments_batch (was {len(ctx.review_comments_batch)} items)")
-            ctx.review_comments_batch = None
-            context_str = ctx.to_json_string()
-            logger.info(f"Context size after dropping review_comments_batch: {len(context_str)} chars")
+        # 3. 丢弃 review_comments_batch
+        if ctx.review_comments_batch:
+            def drop_review_comments():
+                logger.info(f"Dropping review_comments_batch (was {len(ctx.review_comments_batch)} items)")
+                ctx.review_comments_batch = None
+            reduction_steps.append(drop_review_comments)
 
-        # 如果仍然超限，丢弃 reviews_history
-        if len(context_str) > GITHUB_INPUTS_MAX_SIZE and ctx.reviews_history:
-            logger.info(f"Dropping reviews_history (was {len(ctx.reviews_history)} items)")
-            ctx.reviews_history = None
+        # 4. 丢弃 reviews_history
+        if ctx.reviews_history:
+            def drop_reviews_history():
+                logger.info(f"Dropping reviews_history (was {len(ctx.reviews_history)} items)")
+                ctx.reviews_history = None
+            reduction_steps.append(drop_reviews_history)
+
+        for step in reduction_steps:
+            if len(context_str) <= GITHUB_INPUTS_MAX_SIZE:
+                break
+            step()
             context_str = ctx.to_json_string()
-            logger.info(f"Context size after dropping reviews_history: {len(context_str)} chars")
+            logger.info(f"Context size after reduction: {len(context_str)} chars")
 
         # 最终检查
         if len(context_str) > GITHUB_INPUTS_MAX_SIZE:
@@ -1040,21 +1045,18 @@ async def trigger_workflow(client: httpx.AsyncClient, ctx: TaskContext, task_tex
     # 构建 payload
     payload = {
         "ref": "main",
-        "client_payload": {}
+        "inputs": {}
     }
 
-    if use_repository_dispatch:
-        # 使用 repository_dispatch
-        payload["client_payload"]["task"] = task_text[:2000] if task_text else ""
-        payload["client_payload"]["context"] = context_str if context_str else ""
-        if issue_number:
-            payload["client_payload"]["issue_number"] = issue_number
-    else:
-        # 回退到 workflow_dispatch（数据已截断）
-        payload["inputs"] = {
-            "task": task_text[:2000],
-            "context": context_str
-        }
+    task_to_send = task_text[:2000] if task_text else ""
+    context_to_send = context_str if context_str else ""
+
+    # workflow_dispatch API 端点 (/actions/workflows/{workflow_id}/dispatches)
+    # 期望在 payload 中接收一个 inputs 对象来传递参数
+    payload["inputs"]["task"] = task_to_send
+    payload["inputs"]["context"] = context_to_send
+    if issue_number:
+        payload["inputs"]["issue_number"] = issue_number
 
     try:
         r = await client.post(url, headers=headers, json=payload)
